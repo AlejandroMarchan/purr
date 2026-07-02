@@ -121,6 +121,9 @@ final class AppCoordinator: ObservableObject {
     private var meetingObserver: AnyCancellable?
     private var voiceEditObserver: AnyCancellable?
 
+    // Recordings shorter than this are accidental taps - not worth an entry.
+    private static let minKeepSamples = 16_000 * 4 / 10
+
     private var levelTask: Task<Void, Never>?
     // When the current dictation entered the recording state. Lets us tell a
     // genuine "held the key and spoke but the mic was still waking" failure
@@ -659,7 +662,7 @@ final class AppCoordinator: ObservableObject {
         recordingStartedAt = nil
         let samples = recorder.stop()
         let seconds = Double(samples.count) / 16_000.0
-        if samples.count >= 16_000 * 4 / 10 {
+        if samples.count >= Self.minKeepSamples {
             let entryID = UUID()
             HistoryStore.shared.add(
                 DictationEntry(
@@ -698,7 +701,7 @@ final class AppCoordinator: ObservableObject {
         feedTask = nil
         streamingSession = nil
         streamingTask = nil
-        if samples.count >= 16_000 * 4 / 10 {
+        if samples.count >= Self.minKeepSamples {
             let entryID = UUID()
             HistoryStore.shared.add(
                 DictationEntry(
@@ -748,7 +751,7 @@ final class AppCoordinator: ObservableObject {
         log.info(
             "Batch recording finished: \(samples.count, privacy: .public) samples (\(String(format: "%.2f", seconds), privacy: .public)s)"
         )
-        guard samples.count >= 16_000 * 4 / 10 else {
+        guard samples.count >= Self.minKeepSamples else {
             // Distinguish a wake-up failure - the key was held for a real moment
             // but the mic delivered almost nothing because it was still powering
             // up - from a quick accidental tap. The former gets an honest
@@ -964,6 +967,12 @@ final class AppCoordinator: ObservableObject {
                 // batch where transcribe() output includes command phrases
                 // verbatim.
                 rawParts.append(utteranceRaw)
+
+                // A buffered EOU can drain after Esc (the user's pre-cancel
+                // silence is exactly what fires it) - record it in the raw
+                // stream but never let it touch the document.
+                guard !streamingCancelledByUser else { continue }
+
                 preview = ""
                 hud.updatePreview("")
 
@@ -1015,7 +1024,7 @@ final class AppCoordinator: ObservableObject {
         // Same short-tap threshold as batch: sub-400ms holds don't clutter
         // the history.
         var entryID: UUID?
-        if samples.count >= 16_000 * 4 / 10 {
+        if samples.count >= Self.minKeepSamples {
             let id = UUID()
             entryID = id
             HistoryStore.shared.add(
