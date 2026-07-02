@@ -50,7 +50,20 @@ LLAMA_FRAMEWORK_SRC := $(BUILD_DIR)/arm64-apple-macosx/$(CONFIG)/llama.framework
 DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 export DEVELOPER_DIR
 
-.PHONY: app run dmg notarize-app clean
+# PurrTests (Tests/PurrTests) uses Swift Testing (`import Testing`), not XCTest.
+# Command Line Tools ships Testing.framework, but it lives at a fixed path
+# instead of inside a platform SDK, and `swift test` normally locates it by
+# asking `xcrun --show-sdk-platform-path` for the search path - a call that
+# only works when Xcode is installed. Without Xcode that call errors, SwiftPM
+# never adds the framework search path, and `swift test` fails with "no such
+# module 'Testing'". The CLT branch below adds that search path (compile +
+# link) and an rpath (runtime) by hand, and passes -DNO_APPLE_FM to compile out
+# the FoundationModels macro code (see DEVELOPER_DIR above) CLT's toolchain
+# can't build. It also runs with DEVELOPER_DIR unset, since an exported
+# DEVELOPER_DIR pointing at a nonexistent Xcode.app breaks swift/xcrun outright.
+CLT_FRAMEWORKS_DIR := /Library/Developer/CommandLineTools/Library/Developer/Frameworks
+
+.PHONY: app run test dmg notarize-app clean
 
 app:
 	swift build -c $(CONFIG) --arch arm64
@@ -84,6 +97,16 @@ app:
 
 run: app
 	open $(APP_DIR)
+
+test:
+ifeq ($(wildcard $(DEVELOPER_DIR)),)
+	env -u DEVELOPER_DIR swift test -Xswiftc -DNO_APPLE_FM \
+	  -Xswiftc -F -Xswiftc $(CLT_FRAMEWORKS_DIR) \
+	  -Xlinker -F -Xlinker $(CLT_FRAMEWORKS_DIR) \
+	  -Xlinker -rpath -Xlinker $(CLT_FRAMEWORKS_DIR)
+else
+	swift test
+endif
 
 # Notarize the .app: zip it, submit to Apple's notary service, wait for the
 # ticket, then staple it onto the bundle so the app passes Gatekeeper offline
