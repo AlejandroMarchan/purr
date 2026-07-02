@@ -615,6 +615,7 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func finishRecording() async {
+        SoundCues.play(.recordingStopped)
         if streamingSession != nil {
             await finishStreamingRecording()
         } else {
@@ -630,6 +631,7 @@ final class AppCoordinator: ObservableObject {
         do {
             try recorder.start()
             state = .recording
+            SoundCues.play(.recordingStarted)
             recordingStartedAt = Date()
             // "Warming up…" until the mic delivers its first buffer;
             // startLevelTask() flips it to "Listening" then.
@@ -799,6 +801,7 @@ final class AppCoordinator: ObservableObject {
                 }
 
                 state = .recording
+                SoundCues.play(.recordingStarted)
                 recordingStartedAt = Date()
                 // Reserve the pill's preview area before the first mic buffer
                 // flips it to .recording, so it sizes once and shows the live
