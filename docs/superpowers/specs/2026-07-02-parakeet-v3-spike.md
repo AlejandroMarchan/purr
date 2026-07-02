@@ -72,10 +72,14 @@ would filter identically — the parameter only disambiguates script family, not
 per-language vocabulary/grammar; multilingual capability comes entirely from
 v3's training data.
 
-**Supported languages (v3):** `README.md:38,303`/`Models.md:14`: 25 European
-languages plus Japanese. `TokenLanguageFilter.swift:4-37`'s `Language` enum
-(26 codes, Latin/Cyrillic/Greek only) is the script-filter allowlist, not the
-full training-language list.
+**Supported languages (v3):** `Models.md:14` and `README.md:303`: **25
+European languages** (Spanish included). Japanese is *not* a v3 capability —
+it is the separate `.tdtJa` model with its own HF repo
+(`parakeet-0.6b-ja-coreml`; `AsrModels.swift:5-20`, `Models.md:13-16`), out of
+scope here (`README.md:38`'s "25 European languages and Japanese" is a rollup
+of the whole TDT family, not a v3 claim). `TokenLanguageFilter.swift:4-37`'s
+`Language` enum (28 codes, Latin/Cyrillic/Greek only) is the script-filter
+allowlist, not the full training-language list.
 
 **Diarizer coupling:** none. `grep -rn "AsrModelVersion|AsrManager|AsrModels"`
 over `Diarizer/` returns zero matches — diarization (segmentation + embedding
