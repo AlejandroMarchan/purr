@@ -31,11 +31,13 @@ struct HistoryView: View {
             } else {
                 List {
                     ForEach(store.entries) { entry in
+                        let hasAudio = store.audioURL(for: entry) != nil
                         HistoryRow(
                             entry: entry,
                             isRetrying: retryInFlight.contains(entry.id),
-                            canRetry: store.audioURL(for: entry) != nil && retryInFlight.isEmpty, // One retry at a time: each Whisper retry loads its own model instance.
-                            onCopy: { copy(entry) },
+                            canRetry: hasAudio && retryInFlight.isEmpty, // One retry at a time: each Whisper retry loads its own model instance.
+                            canExport: hasAudio,
+                            onCopy: { copy($0) },
                             onRetry: { engine in retry(entry, engine: engine) },
                             onExport: { export(entry) },
                             onDelete: { store.delete(entry.id) }
@@ -77,14 +79,14 @@ struct HistoryView: View {
             }
             .fixedSize()
             .help("How long dictation audio is kept for Retry. Text stays until you delete it.")
-            .onChange(of: settings.historyAudioRetention) { _ in
+            .onChange(of: settings.historyAudioRetention) {
                 store.sweepExpiredAudio()
             }
             Spacer()
             Button("Delete All History", role: .destructive) {
                 showDeleteAllConfirmation = true
             }
-            .disabled(store.entries.isEmpty)
+            .disabled(store.entries.isEmpty || !retryInFlight.isEmpty) // A retry in flight targets an entry by id - don't yank the rug.
             .confirmationDialog(
                 "Delete all history?", isPresented: $showDeleteAllConfirmation
             ) {
@@ -96,8 +98,7 @@ struct HistoryView: View {
         .padding(10)
     }
 
-    private func copy(_ entry: DictationEntry) {
-        guard let text = entry.displayText else { return }
+    private func copy(_ text: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
@@ -128,7 +129,8 @@ private struct HistoryRow: View {
     let entry: DictationEntry
     let isRetrying: Bool
     let canRetry: Bool
-    let onCopy: () -> Void
+    let canExport: Bool
+    let onCopy: (String) -> Void
     let onRetry: (SettingsStore.Engine) -> Void
     let onExport: () -> Void
     let onDelete: () -> Void
@@ -139,6 +141,8 @@ private struct HistoryRow: View {
     private var needsAttention: Bool {
         entry.status == .failed || entry.status == .interrupted
     }
+
+    private var shownText: String? { showRaw ? entry.rawText : entry.displayText }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -153,7 +157,7 @@ private struct HistoryRow: View {
                 Spacer()
                 actions
             }
-            if let text = showRaw ? entry.rawText : entry.displayText, !text.isEmpty {
+            if let text = shownText, !text.isEmpty {
                 Text(text)
                     .lineLimit(3)
                     .textSelection(.enabled)
@@ -192,8 +196,8 @@ private struct HistoryRow: View {
 
     private var engineDisplayName: String {
         if entry.engineUsed == "parakeet" { return "Parakeet" }
-        if let model = entry.engineUsed.split(separator: ":").dropFirst().first {
-            return "Whisper (\(model))"
+        if entry.engineUsed.hasPrefix("whisper:") {
+            return "Whisper (\(entry.engineUsed.dropFirst("whisper:".count)))"
         }
         return entry.engineUsed
     }
@@ -211,17 +215,18 @@ private struct HistoryRow: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
             }
-            Button("Copy", action: onCopy)
-                .disabled(entry.displayText?.isEmpty != false)
+            Button("Copy") { shownText.map(onCopy) }
+                .disabled(shownText?.isEmpty != false)
             if entry.rawText != nil, entry.processedText != nil, entry.rawText != entry.processedText {
                 Toggle("Raw", isOn: $showRaw).toggleStyle(.button).controlSize(.small)
             }
             Button(action: onExport) { Image(systemName: "square.and.arrow.up") }
                 .help("Export audio as WAV")
-                .disabled(!canRetry)
+                .disabled(!canExport)
             Button(role: .destructive, action: { showDeleteConfirmation = true }) {
                 Image(systemName: "trash")
             }
+            .disabled(isRetrying)
             .confirmationDialog("Delete this entry?", isPresented: $showDeleteConfirmation) {
                 Button("Delete", role: .destructive, action: onDelete)
             }
