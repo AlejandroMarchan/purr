@@ -393,9 +393,11 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    // Shared by meeting mode and history retry: Parakeet reuses the shared
+    // Resolves the meeting-transcription engine: Parakeet reuses the shared
     // instance (expensive CoreML pipes), Whisper reuses the dictation engine
     // when the model matches, otherwise a fresh instance lazy-loads.
+    // History retry deliberately does NOT use this - it resolves its own
+    // engine (see retryHistoryEntry) to stay isolated from the live one.
     private func resolveEngine(_ choice: SettingsStore.Engine) -> (engine: any TranscriptionEngine, label: String) {
         switch choice {
         case .parakeet:
