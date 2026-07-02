@@ -1015,7 +1015,18 @@ final class AppCoordinator: ObservableObject {
         do {
             let samples = try WAVFile.read(url: url)
             let prepared = AudioPreprocessor.normalize(samples).samples
-            let (engine, _) = resolveEngine(choice)
+            // Retry never borrows the live dictation engine: a dictation can
+            // start while this transcribe is awaiting, and WhisperKit does not
+            // serialize concurrent calls on one instance. Parakeet's shared
+            // instance is safe - FluidAudio's AsrManager is an actor. Retries
+            // are rare enough that a fresh Whisper pipe (lazy-loaded on first
+            // use) is the right price for isolation.
+            let model = SettingsStore.shared.modelName
+            let engine: any TranscriptionEngine
+            switch choice {
+            case .parakeet: engine = parakeet
+            case .whisper: engine = WhisperEngine(modelName: model)
+            }
             let raw = try await engine.transcribe(samples: prepared)
             let processed = makePostProcessor().apply(raw)
             HistoryStore.shared.update(id) {
@@ -1024,7 +1035,7 @@ final class AppCoordinator: ObservableObject {
                 $0.status = .ok
                 $0.errorMessage = nil
                 $0.engineUsed = Self.engineUsedLabel(
-                    engine: choice, modelName: SettingsStore.shared.modelName)
+                    engine: choice, modelName: model)
             }
         } catch {
             log.error("History retry failed: \(error.localizedDescription, privacy: .public)")
