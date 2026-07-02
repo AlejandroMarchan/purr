@@ -639,6 +639,14 @@ final class AppCoordinator: ObservableObject {
         guard state == .recording else { return }
         SoundCues.play(.dictationCancelled)
         if streamingSession != nil {
+            // Close the TOCTOU window before the async teardown: the hotkey
+            // release (or a second Esc, or a fresh press) that follows must
+            // not find .recording while cancelStreamingRecording is still
+            // awaiting - releases would race a second teardown and could
+            // insert text after the cancel. .transcribing makes the release
+            // guard and the press switch both treat us as busy until the
+            // teardown's own state = .idle lands.
+            state = .transcribing
             Task { await cancelStreamingRecording() }
         } else {
             cancelBatchRecording()
