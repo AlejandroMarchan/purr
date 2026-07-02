@@ -182,9 +182,7 @@ final class AppCoordinator: ObservableObject {
             hud: hud,
             summarizer: summarizer,
             engineProvider: { [weak self] in
-                // Interim: always Parakeet. Task 7 switches this on the
-                // meeting.engine setting.
-                (self?.parakeet ?? ParakeetEngine(), "Parakeet TDT v2")
+                self?.currentMeetingEngine() ?? (ParakeetEngine(), "Parakeet TDT v2")
             }
         )
         voiceEditor = VoiceEditor(hud: hud) { [weak self] in
@@ -387,6 +385,25 @@ final class AppCoordinator: ObservableObject {
         }
         if !initial {
             log.info("Engine switched to \(chosen.rawValue, privacy: .public)")
+        }
+    }
+
+    // Resolves the meeting-transcription engine from Settings at the moment
+    // a meeting stops. Parakeet reuses the shared instance (its CoreML pipes
+    // are expensive to duplicate). Whisper reuses the dictation engine when
+    // it's already a matching WhisperEngine; otherwise a fresh instance
+    // lazy-loads on first use - meetings are infrequent enough that keeping
+    // a second pipe resident isn't worth it.
+    private func currentMeetingEngine() -> (engine: any TranscriptionEngine, label: String) {
+        switch SettingsStore.shared.meetingEngine {
+        case .parakeet:
+            return (parakeet, "Parakeet TDT v2")
+        case .whisper:
+            let model = SettingsStore.shared.modelName
+            if let existing = engine as? WhisperEngine, existing.modelIdentifier == model {
+                return (existing, "Whisper (\(model))")
+            }
+            return (WhisperEngine(modelName: model), "Whisper (\(model))")
         }
     }
 
