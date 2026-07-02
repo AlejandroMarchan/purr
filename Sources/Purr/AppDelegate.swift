@@ -43,6 +43,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Purr has no Dock icon, and a crowded menu bar (or the notch) can push
+    // its status item out of sight - leaving no visible way into the app.
+    // Opening Purr again from Finder/Launchpad/Spotlight lands here: surface
+    // the right window instead of doing nothing. Onboarding while setup is
+    // incomplete, Settings otherwise.
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication, hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag {
+            if !SettingsStore.shared.onboardingDone || !Permissions.allGranted() {
+                showOnboarding()
+            } else {
+                showSettings()
+            }
+        }
+        // With windows already visible, returning true lets AppKit bring
+        // them to the front.
+        return true
+    }
+
     private func showOnboarding() {
         if let win = onboardingWindow {
             win.makeKeyAndOrderFront(nil)
