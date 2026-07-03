@@ -174,6 +174,14 @@ struct OnboardingView: View {
         // `open -n` forces a new instance. Without it LaunchServices
         // can briefly route back to the just-quit process's cached
         // state, defeating the relaunch.
+        //
+        // --args passes a transient launch flag (NSArgumentDomain, never
+        // written to disk) that tells the fresh process to reopen onboarding
+        // regardless of its onboardingDone/permission state - the point of
+        // Restart is to land back in onboarding and see the just-granted
+        // permission turn green. Without it, a returning user whose grants are
+        // now all complete would relaunch straight into the menu bar with no
+        // window.
         let script = """
             #!/bin/sh
             set -u
@@ -183,7 +191,7 @@ struct OnboardingView: View {
                 if [ "$i" -gt 150 ]; then break; fi
                 sleep 0.2
             done
-            open -n "\(appPath)"
+            open -n "\(appPath)" --args -BarktorRelaunchToOnboarding YES
             """
         do {
             try script.write(to: scriptURL, atomically: true, encoding: .utf8)

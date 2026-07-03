@@ -38,7 +38,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         coordinator.start()
 
-        if !SettingsStore.shared.onboardingDone || !Permissions.allGranted() {
+        // The onboarding "Restart" button relaunches with this transient flag
+        // (NSArgumentDomain, not persisted) so we reopen onboarding even when a
+        // returning user's grants are now all complete - otherwise clicking
+        // Restart drops them into an empty menu bar. See OnboardingView.quitAndRelaunch.
+        let relaunchedToOnboarding = UserDefaults.standard.bool(forKey: "BarktorRelaunchToOnboarding")
+        if relaunchedToOnboarding || !SettingsStore.shared.onboardingDone || !Permissions.allGranted() {
             // First launch, or a regression from a permission being revoked
             // (System Settings can flip these any time): walk the user
             // through the three TCC prompts before they try to use a hotkey
