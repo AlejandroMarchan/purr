@@ -282,6 +282,22 @@ struct SettingsView: View {
                     .help(
                         "Show the floating \u{201C}Meeting \u{00B7} 0:00\u{201D} pill with a live waveform while a meeting records. When off, the menu bar still shows a recording indicator."
                     )
+                Picker("Meeting engine", selection: $settings.meetingEngine) {
+                    ForEach(SettingsStore.Engine.allCases) { engine in
+                        Text(engine.label).tag(engine)
+                    }
+                }
+                .disabled(!settings.meetingEnabled)
+                .help(
+                    "Engine used to transcribe meetings, independent of the dictation engine. Parakeet is English-only; Whisper covers 100+ languages."
+                )
+                if settings.meetingEngine == .whisper {
+                    Text(
+                        "Whisper uses the model selected in the Engine tab — make sure it's downloaded there before your meeting."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
                 fluidModelCard(
                     name: "Diarization",
                     size: "~21 MB",

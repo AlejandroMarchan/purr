@@ -18,7 +18,9 @@ import os.log
 //
 // While a meeting is recording, dictation is suspended at the hotkey
 // layer - accidentally inserting batch transcripts mid-meeting would be
-// bad. Voice-edit is independent and can fire any time.
+// bad. Voice-edit is independent and can fire any time the meeting isn't
+// actively processing (see handleVoiceEditPress()) - during processing it
+// may share the same WhisperEngine instance as the meeting transcription.
 @MainActor
 final class AppCoordinator: ObservableObject {
     enum State: Equatable {
@@ -178,7 +180,13 @@ final class AppCoordinator: ObservableObject {
         // on Bluetooth to avoid pinning it to SCO mode.
         recorder.allowsWarmKeeping = true
 
-        meeting = MeetingPipeline(parakeet: parakeet, hud: hud, summarizer: summarizer)
+        meeting = MeetingPipeline(
+            hud: hud,
+            summarizer: summarizer,
+            engineProvider: { [weak self] in
+                self?.currentMeetingEngine() ?? (ParakeetEngine(), "Parakeet TDT v2")
+            }
+        )
         voiceEditor = VoiceEditor(hud: hud) { [weak self] in
             // Voice-edit always uses whichever engine the user has selected
             // - they may want fast Tiny EN for edits even if Parakeet is
@@ -382,6 +390,25 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    // Resolves the meeting-transcription engine from Settings at the moment
+    // a meeting stops. Parakeet reuses the shared instance (its CoreML pipes
+    // are expensive to duplicate). Whisper reuses the dictation engine when
+    // it's already a matching WhisperEngine; otherwise a fresh instance
+    // lazy-loads on first use - meetings are infrequent enough that keeping
+    // a second pipe resident isn't worth it.
+    private func currentMeetingEngine() -> (engine: any TranscriptionEngine, label: String) {
+        switch SettingsStore.shared.meetingEngine {
+        case .parakeet:
+            return (parakeet, "Parakeet TDT v2")
+        case .whisper:
+            let model = SettingsStore.shared.modelName
+            if let existing = engine as? WhisperEngine, existing.modelIdentifier == model {
+                return (existing, "Whisper (\(model))")
+            }
+            return (WhisperEngine(modelName: model), "Whisper (\(model))")
+        }
+    }
+
     private func installHotkeys() {
         let s = SettingsStore.shared
         var bindings: [HotkeyManager.Binding] = [
@@ -406,7 +433,7 @@ final class AppCoordinator: ObservableObject {
                 .init(
                     action: .voiceEdit,
                     hotkey: s.voiceEditHotkey,
-                    onPress: { [weak self] in self?.voiceEditor.handlePress() },
+                    onPress: { [weak self] in self?.handleVoiceEditPress() },
                     onRelease: { [weak self] in self?.voiceEditor.handleRelease() }
                 ))
         }
@@ -423,6 +450,26 @@ final class AppCoordinator: ObservableObject {
             ))
         hotkey.setBindings(bindings)
         hotkey.install()
+    }
+
+    // currentMeetingEngine() can hand meetings the very same WhisperEngine
+    // instance dictation/voice-edit uses (reused when the Settings model
+    // matches). WhisperKit is a plain class, not an actor - unlike FluidAudio's
+    // AsrManager, it does not serialize concurrent transcribes - so a voice-edit
+    // fired while the meeting pipeline is transcribing would run two
+    // `pipe.transcribe` calls on shared decoder state at once. Block only
+    // `.processing`: meeting transcription is a single batch pass that runs
+    // exclusively there, so `.recording` is safe (mirrors suspendDictation's
+    // silent-ignore behavior - no HUD message, just don't start).
+    private func handleVoiceEditPress() {
+        switch meeting.state {
+        case .processing:
+            log.info("Voice-edit press ignored: meeting is processing (shared engine may be busy).")
+            return
+        case .idle, .recording, .error:
+            break
+        }
+        voiceEditor.handlePress()
     }
 
     private func handleQuitHotkey() {
