@@ -126,7 +126,7 @@ final class AppCoordinator: ObservableObject {
     // genuine "held the key and spoke but the mic was still waking" failure
     // from a quick accidental tap.
     private var recordingStartedAt: Date?
-    private var streamingTask: Task<Void, Never>?
+    private var streamingTask: Task<(raw: String, processed: String), Never>?
     private var streamingSession: (any StreamingSession)?
     // The audio-feed loop, pumping recorder.chunks into the streaming session.
     // Owned here (not nested in streamingTask) so finishStreamingRecording()
@@ -179,6 +179,9 @@ final class AppCoordinator: ObservableObject {
         // Keep the mic warm between presses; the recorder self-skips warming
         // on Bluetooth to avoid pinning it to SCO mode.
         recorder.allowsWarmKeeping = true
+
+        HistoryStore.shared.retentionProvider = { SettingsStore.shared.historyAudioRetention }
+        HistoryStore.shared.startDailySweeps()
 
         meeting = MeetingPipeline(
             hud: hud,
@@ -390,14 +393,13 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    // Resolves the meeting-transcription engine from Settings at the moment
-    // a meeting stops. Parakeet reuses the shared instance (its CoreML pipes
-    // are expensive to duplicate). Whisper reuses the dictation engine when
-    // it's already a matching WhisperEngine; otherwise a fresh instance
-    // lazy-loads on first use - meetings are infrequent enough that keeping
-    // a second pipe resident isn't worth it.
-    private func currentMeetingEngine() -> (engine: any TranscriptionEngine, label: String) {
-        switch SettingsStore.shared.meetingEngine {
+    // Resolves the meeting-transcription engine: Parakeet reuses the shared
+    // instance (expensive CoreML pipes), Whisper reuses the dictation engine
+    // when the model matches, otherwise a fresh instance lazy-loads.
+    // History retry deliberately does NOT use this - it resolves its own
+    // engine (see retryHistoryEntry) to stay isolated from the live one.
+    private func resolveEngine(_ choice: SettingsStore.Engine) -> (engine: any TranscriptionEngine, label: String) {
+        switch choice {
         case .parakeet:
             return (parakeet, "Parakeet TDT v2")
         case .whisper:
@@ -407,6 +409,11 @@ final class AppCoordinator: ObservableObject {
             }
             return (WhisperEngine(modelName: model), "Whisper (\(model))")
         }
+    }
+
+    // Resolves the meeting-transcription engine from Settings at the moment a meeting stops.
+    private func currentMeetingEngine() -> (engine: any TranscriptionEngine, label: String) {
+        resolveEngine(SettingsStore.shared.meetingEngine)
     }
 
     private func installHotkeys() {
@@ -663,6 +670,19 @@ final class AppCoordinator: ObservableObject {
             state = .idle
             return
         }
+        // History entry BEFORE transcription: if the engine crashes or the
+        // app dies mid-transcribe, the entry (and its WAV, written in the
+        // background) is already on disk and shows up as Interrupted with a
+        // Retry button on next launch.
+        let entryID = UUID()
+        HistoryStore.shared.add(
+            DictationEntry(
+                id: entryID, date: Date(), duration: seconds,
+                rawText: nil, processedText: nil,
+                engineUsed: Self.engineUsedLabel(
+                    engine: SettingsStore.shared.engine, modelName: SettingsStore.shared.modelName),
+                mode: .batch, status: .interrupted, errorMessage: nil, audioFilename: nil))
+        HistoryStore.shared.persistAudio(id: entryID, samples: samples)
         state = .transcribing
         hud.show(.transcribing)
 
@@ -704,8 +724,20 @@ final class AppCoordinator: ObservableObject {
                 state = .idle
                 hud.flashCopied()
             }
+            // The history save is synchronous on the main actor - do it after
+            // the text has landed, not before; a crash in between just leaves
+            // a retryable .interrupted entry.
+            HistoryStore.shared.update(entryID) {
+                $0.rawText = raw
+                $0.processedText = processed.text
+                $0.status = .ok
+            }
         } catch {
             log.error("Transcription failed: \(error.localizedDescription, privacy: .public)")
+            HistoryStore.shared.update(entryID) {
+                $0.status = .failed
+                $0.errorMessage = error.localizedDescription
+            }
             await reportError(error)
         }
     }
@@ -774,7 +806,7 @@ final class AppCoordinator: ObservableObject {
                     }
                 }
                 streamingTask = Task { [weak self] in
-                    await self?.runStreamingTask(session: session)
+                    await self?.runStreamingTask(session: session) ?? ("", "")
                 }
             } catch let EngineError.streamingNotSupported(name) {
                 log.error("Streaming not supported by \(name, privacy: .public) - falling back to batch.")
@@ -789,7 +821,9 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func runStreamingTask(session: any StreamingSession) async {
+    private func runStreamingTask(session: any StreamingSession) async -> (
+        raw: String, processed: String
+    ) {
         // Per-sentence commit. Partials only drive the HUD preview - nothing
         // touches the document until a pause (EOU), when we post-process that
         // one sentence and paste it once. Already-committed text is never
@@ -801,6 +835,7 @@ final class AppCoordinator: ObservableObject {
         // transcript). `committed` holds the exact strings pasted so "scratch
         // that" can delete them precisely.
         var committed: [String] = []
+        var rawParts: [String] = []
         var preview = ""
 
         for await event in session.events {
@@ -809,6 +844,11 @@ final class AppCoordinator: ObservableObject {
                 preview += suffix
                 hud.updatePreview(preview)
             case .endOfUtterance(let utteranceRaw):
+                // rawParts is the unedited ASR stream - "scratch that" trims
+                // committed (what was typed) but never the raw record, matching
+                // batch where transcribe() output includes command phrases
+                // verbatim.
+                rawParts.append(utteranceRaw)
                 preview = ""
                 hud.updatePreview("")
 
@@ -845,12 +885,30 @@ final class AppCoordinator: ObservableObject {
         if let last = committed.last?.last, !last.isWhitespace {
             inserter.insert(" ")
         }
+
+        return (rawParts.joined(separator: " "), committed.joined())
     }
 
     private func finishStreamingRecording() async {
         levelTask?.cancel()
         levelTask = nil
-        _ = recorder.stop()
+        let samples = recorder.stop()
+        let seconds = Double(samples.count) / 16_000.0
+        // Same short-tap threshold as batch: sub-400ms holds don't clutter
+        // the history.
+        var entryID: UUID?
+        if samples.count >= 16_000 * 4 / 10 {
+            let id = UUID()
+            entryID = id
+            HistoryStore.shared.add(
+                DictationEntry(
+                    id: id, date: Date(), duration: seconds,
+                    rawText: nil, processedText: nil,
+                    engineUsed: Self.engineUsedLabel(
+                        engine: SettingsStore.shared.engine, modelName: SettingsStore.shared.modelName),
+                    mode: .streaming, status: .interrupted, errorMessage: nil, audioFilename: nil))
+            HistoryStore.shared.persistAudio(id: id, samples: samples)
+        }
         hud.setPreviewActive(false)
         state = .transcribing
         hud.show(.transcribing)
@@ -880,7 +938,14 @@ final class AppCoordinator: ObservableObject {
             // run before we tear down. The await is bounded: finish() already
             // closed the stream, so the loop terminates.
             try await session.finish()
-            await streamingTask?.value
+            let texts = await streamingTask?.value
+            if let entryID, let texts {
+                HistoryStore.shared.update(entryID) {
+                    $0.rawText = texts.raw
+                    $0.processedText = texts.processed
+                    $0.status = .ok
+                }
+            }
             streamingSession = nil
             streamingTask = nil
             state = .idle
@@ -890,7 +955,15 @@ final class AppCoordinator: ObservableObject {
             // the consumer loop terminates, then drain both tasks (now bounded)
             // instead of leaking them.
             await session.cancel()
-            await streamingTask?.value
+            let texts = await streamingTask?.value
+            if let entryID {
+                HistoryStore.shared.update(entryID) {
+                    if let texts, !texts.raw.isEmpty { $0.rawText = texts.raw }
+                    if let texts, !texts.processed.isEmpty { $0.processedText = texts.processed }
+                    $0.status = .failed
+                    $0.errorMessage = error.localizedDescription
+                }
+            }
             feedTask?.cancel()
             feedTask = nil
             streamingSession = nil
@@ -934,6 +1007,61 @@ final class AppCoordinator: ObservableObject {
             customVoiceCommands: SettingsStore.shared.customVoiceCommands,
             dictionary: SettingsStore.shared.dictionary
         )
+    }
+
+    // Re-runs transcription + post-processing over a history entry's saved
+    // WAV. Updates the entry in place - never types into other apps: the
+    // user's cursor is wherever they left it, not where it was when the
+    // original dictation ran.
+    func retryHistoryEntry(_ id: UUID, using choice: SettingsStore.Engine) async {
+        guard let entry = HistoryStore.shared.entries.first(where: { $0.id == id }),
+            let url = HistoryStore.shared.audioURL(for: entry)
+        else { return }
+        guard HistoryStore.shared.beginRetry(id) else { return }
+        defer { HistoryStore.shared.endRetry(id) }
+        do {
+            let samples = try WAVFile.read(url: url)
+            let prepared = AudioPreprocessor.normalize(samples).samples
+            // Retry never borrows the live dictation engine: a dictation can
+            // start while this transcribe is awaiting, and WhisperKit does not
+            // serialize concurrent calls on one instance. Parakeet's shared
+            // instance is safe - FluidAudio's AsrManager is an actor. Retries
+            // are rare enough that a fresh Whisper pipe (lazy-loaded on first
+            // use) is the right price for isolation.
+            let model = SettingsStore.shared.modelName
+            let engine: any TranscriptionEngine
+            switch choice {
+            case .parakeet: engine = parakeet
+            case .whisper: engine = WhisperEngine(modelName: model)
+            }
+            let raw = try await engine.transcribe(samples: prepared)
+            let processed = makePostProcessor().apply(raw)
+            HistoryStore.shared.update(id) {
+                $0.rawText = raw
+                $0.processedText = processed.text
+                $0.status = .ok
+                $0.errorMessage = nil
+                $0.engineUsed = Self.engineUsedLabel(
+                    engine: choice, modelName: model)
+            }
+        } catch {
+            log.error("History retry failed: \(error.localizedDescription, privacy: .public)")
+            HistoryStore.shared.update(id) {
+                $0.status = .failed
+                $0.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    // Spec format for DictationEntry.engineUsed: stable machine-ish strings,
+    // rendered human-friendly by HistoryView.
+    nonisolated static func engineUsedLabel(
+        engine: SettingsStore.Engine, modelName: String
+    ) -> String {
+        switch engine {
+        case .parakeet: return "parakeet"
+        case .whisper: return "whisper:\(modelName)"
+        }
     }
 
     private func reportError(_ error: Error) async {
