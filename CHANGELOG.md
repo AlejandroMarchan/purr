@@ -16,6 +16,7 @@ All notable changes to Barktor are documented here. The format follows
   `~/Library/Application Support/Barktor/Meetings`.
 
 ### Added
+- New Barktor app icon and menu-bar glyph.
 - One-time migration from a 0.2.x Purr install: settings, dictation
   history, downloaded models, and meeting transcripts all move to the new
   identity automatically on first launch. If you update in place from
