@@ -52,9 +52,13 @@ final class Updater: ObservableObject {
     private let log = Logger(subsystem: "com.naktor.purr", category: "updater")
     private var downloader: UpdateDownloader?
 
-    var currentVersion: String {
+    // Static so views that only need the number (Settings) don't need the
+    // updater instance.
+    static var installedVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
     }
+
+    var currentVersion: String { Self.installedVersion }
 
     @MainActor
     func checkForUpdates() async {
