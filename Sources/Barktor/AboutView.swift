@@ -37,15 +37,20 @@ struct AboutView: View {
             updateSection
                 .frame(maxWidth: .infinity)
 
-            (Text("Built by ")
+            (Text("Barktor, by ")
+                + Text("[Naktor](https://naktor.com)")
+                + Text(". Built on ")
+                + Text("[Purr](https://github.com/iamarunbrahma/purr)")
+                + Text(" by ")
                 + Text("[Arun Brahma](https://arunbrahma.com)")
                 + Text("."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .tint(.secondary)
+                .multilineTextAlignment(.center)
         }
         .padding(24)
-        .frame(width: 380, height: 320)
+        .frame(width: 380, height: 332)
         .sheet(isPresented: $showWhatsNew) { ChangelogSheet() }
         .onAppear {
             // Quietly check on first open. The user can re-trigger from the

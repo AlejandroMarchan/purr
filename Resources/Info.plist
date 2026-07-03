@@ -33,7 +33,7 @@
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Barktor captures system audio so meeting recordings include the remote participants. Audio is transcribed locally and never leaves your Mac.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>MIT licensed open source.</string>
+	<string>Barktor, by Naktor. MIT licensed open source.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Barktor records your voice locally to transcribe it into text. Audio never leaves your Mac.</string>
 </dict>

@@ -4,6 +4,8 @@
 
 # Barktor
 
+**Barktor, by [Naktor](https://naktor.com)**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)](#)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-orange)](#)
