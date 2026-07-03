@@ -42,6 +42,7 @@ final class SettingsStore: ObservableObject {
         static let historyAudioRetention = "history.audioRetention"
         static let llmPostProcessLevel = "postprocess.llmLevel"
         static let llmCustomInstructions = "postprocess.customInstructions"
+        static let soundCues = "sound.cues"
     }
 
     // Which on-device LLM produces the meeting summary. Apple FM is the
@@ -165,6 +166,12 @@ final class SettingsStore: ObservableObject {
     // "format enumerations as bullet lists").
     @Published var llmCustomInstructions: String {
         didSet { defaults.set(llmCustomInstructions, forKey: Keys.llmCustomInstructions) }
+    }
+
+    // Audible confirmation that a recording actually started/stopped -
+    // dictation is eyes-free, so the HUD alone is easy to miss.
+    @Published var soundCues: Bool {
+        didSet { defaults.set(soundCues, forKey: Keys.soundCues) }
     }
 
     // Whisper-only: when on, transcription runs the X→English translate task
@@ -292,6 +299,7 @@ final class SettingsStore: ObservableObject {
             defaults.string(forKey: Keys.llmPostProcessLevel) ?? LLMPostProcessLevel.off.rawValue
         self.llmPostProcessLevel = LLMPostProcessLevel(rawValue: storedLLMLevel) ?? .off
         self.llmCustomInstructions = defaults.string(forKey: Keys.llmCustomInstructions) ?? ""
+        self.soundCues = defaults.object(forKey: Keys.soundCues) as? Bool ?? true
         self.translateToEnglish = defaults.object(forKey: Keys.translateToEnglish) as? Bool ?? false
         self.translationSourceLanguage = defaults.string(forKey: Keys.translationSourceLanguage) ?? ""
         self.smartTyping = defaults.object(forKey: Keys.smartTyping) as? Bool ?? false
@@ -364,6 +372,7 @@ final class SettingsStore: ObservableObject {
         historyAudioRetention = .week
         llmPostProcessLevel = .off
         llmCustomInstructions = ""
+        soundCues = true
         modelName = ModelManager.defaultModel
         translateToEnglish = false
         translationSourceLanguage = ""

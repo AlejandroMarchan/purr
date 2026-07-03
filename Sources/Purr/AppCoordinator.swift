@@ -121,6 +121,9 @@ final class AppCoordinator: ObservableObject {
     private var meetingObserver: AnyCancellable?
     private var voiceEditObserver: AnyCancellable?
 
+    // Recordings shorter than this are accidental taps - not worth an entry.
+    private static let minKeepSamples = 16_000 * 4 / 10
+
     private var levelTask: Task<Void, Never>?
     // When the current dictation entered the recording state. Lets us tell a
     // genuine "held the key and spoke but the mic was still waking" failure
@@ -138,6 +141,10 @@ final class AppCoordinator: ObservableObject {
     // setup task can bail out instead of starting a recording nobody wants.
     private var streamingStartupInFlight = false
     private var releasedDuringStartup = false
+    // Set by cancelStreamingRecording() so runStreamingTask's post-loop
+    // trailing-space insert knows to stay silent - Esc means no further
+    // insertion, full stop.
+    private var streamingCancelledByUser = false
 
     // Quit callback delivered by AppDelegate. Stored so the global tap hotkey
     // can drive the same code path as the status-bar Quit menu item.
@@ -417,6 +424,7 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func installHotkeys() {
+        hotkey.onEscape = { [weak self] in self?.cancelDictation() }
         let s = SettingsStore.shared
         var bindings: [HotkeyManager.Binding] = [
             .init(
@@ -546,6 +554,11 @@ final class AppCoordinator: ObservableObject {
         return false
     }
 
+    // Double-tap hands-free lock (hold-to-talk only). The arbiter owns the
+    // timing rules; pendingHoldStop is the deferred-stop timer it arms.
+    private var handsFree = HandsFreeLock()
+    private var pendingHoldStop: Task<Void, Never>?
+
     private func handleTranscribePress() {
         if hud.shouldIgnorePress(whileBusy: dictationBusy) {
             log.info("Transcribe press ignored: HUD message up or transcription in flight.")
@@ -565,7 +578,19 @@ final class AppCoordinator: ObservableObject {
         )
         switch SettingsStore.shared.hotkeyMode {
         case .holdToTalk:
-            beginRecording()
+            switch handsFree.press(at: ContinuousClock.now, recordingAlive: dictationAlive) {
+            case .begin:
+                cancelPendingHoldStop()
+                beginRecording()
+            case .lock:
+                // Double-tap: the deferred stop is abandoned, the recording
+                // keeps running with no key held until the next press. The
+                // HUD staying up after the release is the feedback.
+                cancelPendingHoldStop()
+                log.info("Hands-free lock engaged - dictation runs until the next press.")
+            case .stop:
+                performHoldStop()
+            }
         case .toggle:
             switch state {
             case .idle, .error: beginRecording()
@@ -580,6 +605,44 @@ final class AppCoordinator: ObservableObject {
             "Transcribe release received (state=\(String(describing: self.state), privacy: .public), startupInFlight=\(self.streamingStartupInFlight, privacy: .public))"
         )
         guard SettingsStore.shared.hotkeyMode == .holdToTalk else { return }
+        switch handsFree.release(at: ContinuousClock.now) {
+        case .ignore:
+            break
+        case .stop:
+            performHoldStop()
+        case .deferStop:
+            // The hold was tap-short: hold the stop back briefly so a quick
+            // second press can turn it into a hands-free lock instead.
+            pendingHoldStop?.cancel()
+            pendingHoldStop = Task { [weak self] in
+                try? await Task.sleep(for: HandsFreeLock.secondPressWindow)
+                guard let self, !Task.isCancelled else { return }
+                self.pendingHoldStop = nil
+                if self.handsFree.deferredStopFired() { self.performHoldStop() }
+            }
+        }
+    }
+
+    private var dictationAlive: Bool { state == .recording || streamingStartupInFlight }
+
+    // A hotkey-mode switch mid-gesture must not leave a lock or an armed
+    // deferred stop behind: a stale timer could otherwise stop a dictation
+    // started moments later in toggle mode.
+    func hotkeyModeChanged() {
+        handsFree.reset()
+        cancelPendingHoldStop()
+    }
+
+    private func cancelPendingHoldStop() {
+        pendingHoldStop?.cancel()
+        pendingHoldStop = nil
+    }
+
+    // The stop half of hold-to-talk, shared by direct releases, deferred
+    // (double-tap window) releases, and the locked-mode stop press. Stale
+    // calls are safe: finishRecording guards on state, and re-flagging
+    // releasedDuringStartup is idempotent.
+    private func performHoldStop() {
         if state == .recording {
             Task { await finishRecording() }
         } else if streamingStartupInFlight {
@@ -615,11 +678,103 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func finishRecording() async {
+        // After an Esc cancel the hotkey release still arrives; the recorder
+        // is already stopped and the Cancelled message is on the HUD - a
+        // stale finish must not wipe it or re-enter the batch flow.
+        guard state == .recording else { return }
+        SoundCues.play(.recordingStopped)
         if streamingSession != nil {
             await finishStreamingRecording()
         } else {
             await finishBatchRecording()
         }
+    }
+
+    // Esc during recording discards the dictation without ever calling an
+    // engine. The audio still lands in history as a cancelled entry
+    // (retryable), so a mistaken Esc loses nothing but the keystrokes.
+    func cancelDictation() {
+        guard state == .recording else { return }
+        // Esc kills the dictation the lock refers to: drop the lock and any
+        // deferred stop so the next press reads as a fresh start.
+        handsFree.reset()
+        cancelPendingHoldStop()
+        SoundCues.play(.dictationCancelled)
+        if streamingSession != nil {
+            // Close the TOCTOU window before the async teardown: the hotkey
+            // release (or a second Esc, or a fresh press) that follows must
+            // not find .recording while cancelStreamingRecording is still
+            // awaiting - releases would race a second teardown and could
+            // insert text after the cancel. .transcribing makes the release
+            // guard and the press switch both treat us as busy until the
+            // teardown's own state = .idle lands.
+            state = .transcribing
+            Task { await cancelStreamingRecording() }
+        } else {
+            cancelBatchRecording()
+        }
+    }
+
+    private func cancelBatchRecording() {
+        levelTask?.cancel()
+        levelTask = nil
+        recordingStartedAt = nil
+        let samples = recorder.stop()
+        let seconds = Double(samples.count) / 16_000.0
+        if samples.count >= Self.minKeepSamples {
+            let entryID = UUID()
+            HistoryStore.shared.add(
+                DictationEntry(
+                    id: entryID, date: Date(), duration: seconds,
+                    rawText: nil, processedText: nil,
+                    engineUsed: Self.engineUsedLabel(
+                        engine: SettingsStore.shared.engine,
+                        modelName: SettingsStore.shared.modelName),
+                    mode: .batch, status: .cancelled, errorMessage: nil, audioFilename: nil))
+            HistoryStore.shared.persistAudio(id: entryID, samples: samples)
+        }
+        state = .idle
+        hud.showMessage("Cancelled", autoHideAfter: 1.5)
+    }
+
+    private func cancelStreamingRecording() async {
+        levelTask?.cancel()
+        levelTask = nil
+        recordingStartedAt = nil
+        streamingCancelledByUser = true
+        let samples = recorder.stop()
+        let seconds = Double(samples.count) / 16_000.0
+        hud.setPreviewActive(false)
+        guard let session = streamingSession else {
+            state = .idle
+            hud.showMessage("Cancelled", autoHideAfter: 1.5)
+            return
+        }
+        // Same teardown order as finishStreamingRecording's failure path:
+        // cancel the session (closes the events stream), drain the consumer,
+        // then kill the feed. No further text is inserted - the trailing
+        // space is suppressed by streamingCancelledByUser.
+        await session.cancel()
+        let texts = await streamingTask?.value
+        feedTask?.cancel()
+        feedTask = nil
+        streamingSession = nil
+        streamingTask = nil
+        if samples.count >= Self.minKeepSamples {
+            let entryID = UUID()
+            HistoryStore.shared.add(
+                DictationEntry(
+                    id: entryID, date: Date(), duration: seconds,
+                    rawText: texts.flatMap { $0.raw.isEmpty ? nil : $0.raw },
+                    processedText: texts.flatMap { $0.processed.isEmpty ? nil : $0.processed },
+                    engineUsed: Self.engineUsedLabel(
+                        engine: SettingsStore.shared.engine,
+                        modelName: SettingsStore.shared.modelName),
+                    mode: .streaming, status: .cancelled, errorMessage: nil, audioFilename: nil))
+            HistoryStore.shared.persistAudio(id: entryID, samples: samples)
+        }
+        state = .idle
+        hud.showMessage("Cancelled", autoHideAfter: 1.5)
     }
 
     // ------------------------------------------------------------------
@@ -630,6 +785,7 @@ final class AppCoordinator: ObservableObject {
         do {
             try recorder.start()
             state = .recording
+            SoundCues.play(.recordingStarted)
             recordingStartedAt = Date()
             // "Warming up…" until the mic delivers its first buffer;
             // startLevelTask() flips it to "Listening" then.
@@ -654,7 +810,7 @@ final class AppCoordinator: ObservableObject {
         log.info(
             "Batch recording finished: \(samples.count, privacy: .public) samples (\(String(format: "%.2f", seconds), privacy: .public)s)"
         )
-        guard samples.count >= 16_000 * 4 / 10 else {
+        guard samples.count >= Self.minKeepSamples else {
             // Distinguish a wake-up failure - the key was held for a real moment
             // but the mic delivered almost nothing because it was still powering
             // up - from a quick accidental tap. The former gets an honest
@@ -768,6 +924,7 @@ final class AppCoordinator: ObservableObject {
     private func beginStreamingRecording() {
         streamingStartupInFlight = true
         releasedDuringStartup = false
+        streamingCancelledByUser = false
         Task {
             do {
                 let session = try await engine.makeStreamingSession()
@@ -799,6 +956,7 @@ final class AppCoordinator: ObservableObject {
                 }
 
                 state = .recording
+                SoundCues.play(.recordingStarted)
                 recordingStartedAt = Date()
                 // Reserve the pill's preview area before the first mic buffer
                 // flips it to .recording, so it sizes once and shows the live
@@ -868,6 +1026,12 @@ final class AppCoordinator: ObservableObject {
                 // batch where transcribe() output includes command phrases
                 // verbatim.
                 rawParts.append(utteranceRaw)
+
+                // A buffered EOU can drain after Esc (the user's pre-cancel
+                // silence is exactly what fires it) - record it in the raw
+                // stream but never let it touch the document.
+                guard !streamingCancelledByUser else { continue }
+
                 preview = ""
                 hud.updatePreview("")
 
@@ -901,7 +1065,10 @@ final class AppCoordinator: ObservableObject {
         // Separate dictation sessions so the next press doesn't butt up
         // ("worldfoo"): one trailing space, unless the last sentence already
         // ended in whitespace (e.g. a "new line" command).
-        if let last = committed.last?.last, !last.isWhitespace {
+        //
+        // Skip the session-separator space when the user cancelled - "no
+        // further insertion" is the whole point of Esc.
+        if !streamingCancelledByUser, let last = committed.last?.last, !last.isWhitespace {
             inserter.insert(" ")
         }
 
@@ -916,7 +1083,7 @@ final class AppCoordinator: ObservableObject {
         // Same short-tap threshold as batch: sub-400ms holds don't clutter
         // the history.
         var entryID: UUID?
-        if samples.count >= 16_000 * 4 / 10 {
+        if samples.count >= Self.minKeepSamples {
             let id = UUID()
             entryID = id
             HistoryStore.shared.add(

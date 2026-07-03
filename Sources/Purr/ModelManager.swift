@@ -86,6 +86,20 @@ enum ModelManager {
         curatedModels.first { $0.id == modelName }?.supportsTranslation ?? false
     }
 
+    // Compact model name for tight UI like history rows: the curated label
+    // without its picker-only suffixes ("Large V3 Turbo (recommended)" ->
+    // "Large V3 Turbo", "Tiny EN - lowest latency" -> "Tiny EN"). Ids no
+    // longer in the curated list fall back to the raw id minus the vendor
+    // prefix, so old history entries stay readable.
+    static func shortLabel(forModel id: String) -> String {
+        guard let label = curatedModels.first(where: { $0.id == id })?.label else {
+            let prefix = "openai_whisper-"
+            return id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
+        }
+        let base = label.components(separatedBy: " - ").first ?? label
+        return base.replacingOccurrences(of: " (recommended)", with: "")
+    }
+
     static var modelsDirectory: URL {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[
             0]
