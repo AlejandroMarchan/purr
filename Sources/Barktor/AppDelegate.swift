@@ -43,7 +43,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // (System Settings can flip these any time): walk the user
             // through the three TCC prompts before they try to use a hotkey
             // that won't fire.
-            showOnboarding()
+            //
+            // Deferred one runloop tick: showOnboarding() promotes the app to
+            // .regular (Dock icon + Cmd-Tab) via syncActivationPolicy(), but
+            // setActivationPolicy doesn't take effect when called synchronously
+            // inside didFinishLaunching - the change lands asynchronously, after
+            // launch completes. Called inline, the Dock icon never appears at
+            // first launch or after a Restart relaunch until a later window open
+            // re-triggers the policy; deferred, launch itself surfaces
+            // onboarding with full Dock/Cmd-Tab presence.
+            DispatchQueue.main.async { [weak self] in self?.showOnboarding() }
         }
     }
 
