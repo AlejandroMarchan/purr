@@ -67,44 +67,61 @@ struct SettingsView: View {
     // General tab - hotkey, mode, behavior toggles
     // ------------------------------------------------------------------
 
+    // Short name for the compact pop-up; the row subtitle carries the detail.
+    private func gestureShort(_ g: SettingsStore.Gesture) -> String {
+        switch g {
+        case .hold: return "Hold"
+        case .tapToggle: return "Tap"
+        case .doubleTapToggle: return "Double-tap"
+        }
+    }
+
+    private func gestureSubtitle(_ g: SettingsStore.Gesture) -> String {
+        switch g {
+        case .hold: return "Hold to dictate, release to stop"
+        case .tapToggle: return "Tap once to start, tap to stop"
+        case .doubleTapToggle: return "Double-tap to start, double-tap to stop"
+        }
+    }
+
     private var generalTab: some View {
         Form {
-            Section("Dictate Mode") {
-                Picker("Trigger", selection: $settings.hotkeyMode) {
-                    ForEach(SettingsStore.HotkeyMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: settings.hotkeyMode) { coordinator.hotkeyModeChanged() }
-
-                if settings.hotkeyMode == .holdToTalk {
-                    Text("Tip: press twice quickly to lock dictation hands-free, then press once to stop.")
-                        .font(.caption)
+            Section("Dictation") {
+                HStack(alignment: .center, spacing: 12) {
+                    Text(gestureSubtitle(settings.dictationTrigger.gesture))
                         .foregroundStyle(.secondary)
+                    Spacer(minLength: 12)
+                    Picker(
+                        "",
+                        selection: Binding(
+                            get: { settings.dictationTrigger.gesture },
+                            set: {
+                                settings.dictationTrigger.gesture = $0
+                                coordinator.reinstallHotkey()
+                            })
+                    ) {
+                        ForEach(SettingsStore.Gesture.allCases) { g in Text(gestureShort(g)).tag(g) }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    HotkeyRecorderField(
+                        hotkey: settings.dictationTrigger.hotkey,
+                        onChange: {
+                            settings.dictationTrigger.hotkey = $0
+                            coordinator.reinstallHotkey()
+                        },
+                        onCapturingChange: { coordinator.setHotkeyCapture(active: $0) }
+                    )
                 }
-
-                LabeledContent("Hotkey", value: settings.hotkey.displayName)
-
-                HStack(spacing: 6) {
-                    Button("Right Option") {
-                        settings.hotkey = .defaultRightOption
-                        coordinator.reinstallHotkey()
-                    }
-                    Button("Right Command") {
-                        settings.hotkey = Hotkey(keyCode: nil, modifiers: .maskCommand)
-                        coordinator.reinstallHotkey()
-                    }
-                    Button("F5") {
-                        settings.hotkey = Hotkey(keyCode: 96, modifiers: [])
-                        coordinator.reinstallHotkey()
-                    }
-                    Button("⌃⌥ Space") {
-                        settings.hotkey = Hotkey(keyCode: 49, modifiers: [.maskControl, .maskAlternate])
-                        coordinator.reinstallHotkey()
-                    }
+                .padding(.vertical, 4)
+                if settings.dictationTrigger.gesture == .hold {
+                    Text(
+                        "Tip: press twice quickly to lock dictation hands-free, "
+                            + "then press once to stop."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
-                .controlSize(.small)
             }
 
             Section("Microphone") {
@@ -159,6 +176,14 @@ struct SettingsView: View {
                 .onAppear { launchAtLogin.refresh() }
                 Toggle("Sound cues", isOn: $settings.soundCues)
                 Text("Subtle sounds when recording starts, stops, or is cancelled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("While recording", selection: $settings.recordingAudio) {
+                    ForEach(SettingsStore.RecordingAudio.allCases) { action in
+                        Text(action.label).tag(action)
+                    }
+                }
+                Text("Mute other apps' audio (music, video) while you dictate, and restore it when you stop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LabeledContent("Version \(Updater.installedVersion)") {
@@ -240,9 +265,6 @@ struct SettingsView: View {
                 }
 
                 Section("Translation") {
-                    if selectedModelSupportsTranslation {
-                        sourceLanguageField
-                    }
                     Toggle("Translate speech to English", isOn: $settings.translateToEnglish)
                         .disabled(!selectedModelSupportsTranslation)
                         .help("Speak in any language; Whisper writes the transcript in English.")
@@ -269,6 +291,12 @@ struct SettingsView: View {
                         coordinator: coordinator,
                         version: settings.engine == .parakeetV3 ? .v3 : .v2)
                 }
+            }
+
+            // The dictation language lives with the engine too, for any engine
+            // that offers a choice (Parakeet v2 is English-only).
+            if settings.engine.offersLanguagePicker {
+                languageSection
             }
 
             // Smart Typing lives with the engine that provides it: only shown
@@ -801,23 +829,64 @@ struct SettingsView: View {
 
     // The Translate toggle is meaningful only on a multilingual, non-turbo
     // Whisper model. Mirrors WhisperEngine's runtime gate so the UI never
-    // offers an option the engine would ignore. Drives the toggle's
-    // enabled state and the Source Language picker's visibility.
+    // offers an option the engine would ignore. Drives the toggle's enabled
+    // state.
     private var selectedModelSupportsTranslation: Bool {
         ModelManager.supportsTranslation(settings.modelName)
     }
 
-    // Compact row that opens a modal sheet owning the search and full
-    // 100-language list.
+    // Dictation language for the Engine tab — the shared dictationLanguage,
+    // shown for engines that offer a choice (Parakeet v2 is English-only).
+    // Whisper's 100 use the searchable sheet; Nemotron/v3's shorter lists use
+    // an inline menu.
     @ViewBuilder
-    private var sourceLanguageField: some View {
-        let selected = WhisperLanguage.named(settings.translationSourceLanguage)
+    private var languageSection: some View {
+        Section("Language") {
+            if settings.engine == .whisper {
+                whisperLanguageField
+            } else {
+                Picker("Language", selection: clampedLanguageBinding) {
+                    Text("Auto-detect").tag("")
+                    ForEach(settings.engine.languageCodes, id: \.self) { code in
+                        Text(WhisperLanguage.named(code).name).tag(code)
+                    }
+                }
+            }
+            // A language pinned on another engine that this one can't do falls
+            // back to auto-detect - say so rather than silently ignore it.
+            if !settings.dictationLanguage.isEmpty,
+                !settings.engine.languageCodes.contains(settings.dictationLanguage) {
+                Label(
+                    "\(settings.engine.label) doesn't support \(WhisperLanguage.named(settings.dictationLanguage).name) — using auto-detect.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // Shows the shared language clamped to the current engine, so an inline
+    // Picker never holds a selection outside its options (which renders blank).
+    private var clampedLanguageBinding: Binding<String> {
+        Binding(
+            get: { settings.engine.clampedLanguage(settings.dictationLanguage) },
+            set: { settings.dictationLanguage = $0 }
+        )
+    }
+
+    // Whisper's 100-language picker: a compact row opening the searchable sheet.
+    // Sets dictationLanguage, which Whisper uses for both transcription and the
+    // translate source.
+    @ViewBuilder
+    private var whisperLanguageField: some View {
+        let selected = WhisperLanguage.named(settings.dictationLanguage)
 
         Button {
             showLanguagePicker = true
         } label: {
             HStack {
-                Text("Source Language")
+                Text("Language")
                 Spacer()
                 Text(selected.name).foregroundStyle(.secondary)
                 Image(systemName: "chevron.right")
@@ -829,15 +898,15 @@ struct SettingsView: View {
         .buttonStyle(.plain)
         .sheet(isPresented: $showLanguagePicker) {
             LanguagePickerSheet(
-                selection: $settings.translationSourceLanguage,
+                selection: $settings.dictationLanguage,
                 onClose: { showLanguagePicker = false }
             )
         }
 
         Text(
-            settings.translationSourceLanguage.isEmpty
-                ? "Auto-detect can misread very short clips. Select a language for reliable short-phrase translation."
-                : "Detection is skipped. Whisper assumes the audio is \(selected.name)."
+            settings.dictationLanguage.isEmpty
+                ? "Auto-detect can misread very short clips. Pick a language for reliable short-phrase dictation."
+                : "Detection is skipped. Whisper assumes you're speaking \(selected.name)."
         )
         .font(.caption)
         .foregroundStyle(.secondary)

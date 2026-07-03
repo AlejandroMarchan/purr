@@ -266,16 +266,25 @@ final class ParakeetEngine: TranscriptionEngine {
     // alignment when merging diarization output.
     //
     // v2 is English-only (highest English recall on the Open ASR Leaderboard);
-    // `language: .english` is a no-op there. v3 is multilingual and auto-detects
-    // the spoken language, so we pass `nil` (no script filter) to let it cover
-    // all 25 European languages instead of pinning one.
+    // `language: .english` is a no-op there. v3 is multilingual: it honors the
+    // shared dictationLanguage when the user pins one of its ~28 European
+    // languages, and falls back to `nil` (auto-detect, no script filter) for
+    // Auto or a language it can't do.
     func transcribeASR(samples: [Float]) async throws -> ASRResult {
         if batchManager == nil { await warmup() }
         guard let manager = batchManager else { throw EngineError.notLoaded }
         var state = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
         let started = Date()
+        let languageHint: Language?
+        if version == .v2 {
+            languageHint = .english
+        } else {
+            let code = SettingsStore.Engine.parakeetV3.clampedLanguage(
+                SettingsStore.shared.dictationLanguage)
+            languageHint = code.isEmpty ? nil : Language(rawValue: code)
+        }
         let result = try await manager.transcribe(
-            samples, decoderState: &state, language: version == .v2 ? .english : nil)
+            samples, decoderState: &state, language: languageHint)
         let elapsed = Date().timeIntervalSince(started)
         log.info(
             "Parakeet transcribed \(samples.count, privacy: .public) samples in \(String(format: "%.2f", elapsed), privacy: .public)s"

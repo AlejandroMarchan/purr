@@ -6,9 +6,10 @@ import os.log
 // ParakeetEngine juggles two model families (a batch `AsrManager` + the
 // English-only EOU streaming model), this wraps a single
 // `StreamingNemotronMultilingualAsrManager` that does BOTH batch and live
-// streaming for 40 language-locales incl. Spanish. It is the first Barktor
-// engine that streams a non-English language, so it's the only multilingual
-// engine that supports Smart Typing.
+// streaming. We ship the smaller `latin` variant — 6 Latin-script languages
+// (Spanish, English, French, Italian, Portuguese, German). It is the first
+// Barktor engine that streams a non-English language, so it's the only
+// multilingual engine that supports Smart Typing.
 //
 // The multilingual model has NO auto-EOU (silence) detector — unlike the
 // Parakeet EOU model. So a streaming session finalizes on hotkey release:
@@ -22,15 +23,21 @@ import os.log
 final class NemotronStreamingEngine: TranscriptionEngine {
     nonisolated let supportsStreaming = true
 
-    // es-ES is fixed for this first cut (a language picker is a follow-up). The
-    // model still auto-detects, but pinning the prompt_id improves recall.
-    private let languageCode: String
+    // The repo ships a `latin` variant (6 Latin-script langs: es/en/fr/it/pt/de)
+    // and a `multilingual` one (40). We download `latin`, anchored by a Latin
+    // code below, and choose the spoken language at runtime from the shared
+    // dictationLanguage setting (Auto = the model auto-detects among the 6).
+    private static let downloadAnchor = "es"  // routes downloadVariant to `latin`
     // 1120 ms is the model's trained chunk (balanced latency/throughput); the
     // spike measured ~14 ms compute per chunk and append-only partials here.
     private static let chunkMs = 1120
 
-    init(languageCode: String = "es-ES") {
-        self.languageCode = languageCode
+    // The dictation language clamped to Nemotron's 6, mapped to the manager's
+    // hint: "" (auto) or an unsupported code → "auto"; a Latin code → itself.
+    private static func runtimeLanguage() -> String {
+        let code = SettingsStore.Engine.nemotron.clampedLanguage(
+            SettingsStore.shared.dictationLanguage)
+        return code.isEmpty ? "auto" : code
     }
 
     private var manager: StreamingNemotronMultilingualAsrManager?
@@ -93,18 +100,19 @@ final class NemotronStreamingEngine: TranscriptionEngine {
             }
         }
         // downloadVariant nests <base>/<langDir>/<chunk>ms and returns that leaf.
+        // downloadAnchor keeps this on the smaller `latin` variant regardless of
+        // the runtime language choice.
         let dir = try await StreamingNemotronMultilingualAsrManager.downloadVariant(
-            languageCode: languageCode,
+            languageCode: Self.downloadAnchor,
             chunkMs: Self.chunkMs,
             to: Self.baseModelDirectory,
             progressHandler: progressHandler)
         let m = StreamingNemotronMultilingualAsrManager()
         try await m.loadModels(from: dir)
-        await m.setLanguage(languageCode)
+        await m.setLanguage(Self.runtimeLanguage())
         try Task.checkCancellation()
         manager = m
-        log.info(
-            "Nemotron multilingual (\(self.languageCode, privacy: .public)) downloaded and warmed up.")
+        log.info("Nemotron latin model downloaded and warmed up.")
     }
 
     // Drops the in-memory CoreML graphs (and cancels an in-flight load) so a
@@ -129,6 +137,7 @@ final class NemotronStreamingEngine: TranscriptionEngine {
         if manager == nil { await warmup() }
         guard let m = manager else { throw EngineError.notLoaded }
         await m.reset()
+        await m.setLanguage(Self.runtimeLanguage())
         _ = try await m.process(samples: samples)
         let (text, timings) = try await m.finishWithTokenTimings()
         return DetailedTranscription(
@@ -146,8 +155,10 @@ final class NemotronStreamingEngine: TranscriptionEngine {
         if manager == nil { try await downloadAndLoad() }
         guard let m = manager else { throw EngineError.notLoaded }
         // Fresh decoder/cache state per session; the manager is reused across
-        // sessions to keep the ~612 MB of CoreML graphs resident.
+        // sessions to keep the CoreML graphs resident, so re-apply the language
+        // each time in case it changed since the last session.
         await m.reset()
+        await m.setLanguage(Self.runtimeLanguage())
         let session = NemotronStreamingSession(manager: m)
         try await session.start()
         return session

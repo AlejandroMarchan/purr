@@ -12,9 +12,13 @@ final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
     enum Keys {
+        // Legacy hotkey keys, read once to migrate into dictationTrigger:
+        // the pre-0.4 single hotkey+mode, and the short-lived 0.4-dev two-trigger array.
         static let hotkeyKeyCode = "hotkey.keyCode"
         static let hotkeyModifiers = "hotkey.modifiers"
         static let hotkeyMode = "hotkey.mode"
+        static let dictationTriggersArray = "hotkey.dictationTriggers"
+        static let dictationTrigger = "hotkey.dictationTrigger"
         static let inputDeviceUID = "audio.inputDeviceUID"
         static let meetingHotkeyKey = "hotkey.meeting.keyCode"
         static let meetingHotkeyMod = "hotkey.meeting.modifiers"
@@ -30,6 +34,7 @@ final class SettingsStore: ObservableObject {
         static let meetingEngine = "meeting.engine"
         static let translateToEnglish = "stt.translateToEnglish"
         static let translationSourceLanguage = "stt.translationSourceLanguage"
+        static let dictationLanguage = "stt.dictationLanguage"
         static let smartTyping = "ui.smartTyping"
         static let voiceCommands = "ui.voiceCommands"
         static let dictionary = "post.dictionary"
@@ -44,6 +49,24 @@ final class SettingsStore: ObservableObject {
         static let llmPostProcessLevel = "postprocess.llmLevel"
         static let llmCustomInstructions = "postprocess.customInstructions"
         static let soundCues = "sound.cues"
+        static let recordingAudio = "recording.audioAction"
+    }
+
+    // What to do with other apps' audio while a dictation records. Mute
+    // silences the default output device and restores its prior state on stop.
+    // (No "pause" mode: the Play/Pause key is a directionless toggle and macOS
+    // exposes no reliable play-state since MediaRemote was gated in 15.4+, so it
+    // would start music that was merely paused.) See MediaController.
+    enum RecordingAudio: String, Codable, CaseIterable, Identifiable {
+        case nothing
+        case mute
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .nothing: return "Do nothing"
+            case .mute: return "Mute audio"
+            }
+        }
     }
 
     // Which on-device LLM produces the meeting summary. Apple FM is the
@@ -87,7 +110,7 @@ final class SettingsStore: ObservableObject {
                 return "Fastest and most accurate English. Types live as you speak. English only."
             case .nemotron:
                 return
-                    "40 languages incl. Spanish, typed live as you speak — the only multilingual engine with Smart Typing."
+                    "Spanish, English, French, Italian, Portuguese, German — typed live as you speak. The only multilingual engine with Smart Typing."
             case .parakeetV3:
                 return
                     "25 European languages incl. Spanish. The fastest multilingual option; inserts when you finish speaking."
@@ -101,7 +124,7 @@ final class SettingsStore: ObservableObject {
         var languageBadge: String {
             switch self {
             case .parakeet: return "English"
-            case .nemotron: return "40 languages"
+            case .nemotron: return "6 languages"
             case .parakeetV3: return "25 languages"
             case .whisper: return "100+ languages"
             }
@@ -142,26 +165,58 @@ final class SettingsStore: ObservableObject {
             case .parakeetV3, .whisper: return false
             }
         }
+
+        // ISO 639-1 codes this engine can be pinned to (besides Auto). Empty =
+        // the engine ignores language (Parakeet v2 is English-only). Nemotron
+        // runs the 6-language latin variant; v3 covers ~28 European; Whisper the
+        // full 100. Drives the per-engine Language picker and clamps a shared
+        // choice the engine can't honor back to auto-detect.
+        var languageCodes: [String] {
+            switch self {
+            case .parakeet: return []
+            case .nemotron: return ["es", "en", "fr", "it", "pt", "de"]
+            case .parakeetV3:
+                return [
+                    "en", "es", "fr", "de", "it", "pt", "ro", "nl", "da", "sv", "fi", "hu", "et",
+                    "lv", "lt", "mt", "pl", "cs", "sk", "sl", "hr", "bs", "ru", "uk", "be", "bg",
+                    "sr", "el",
+                ]
+            case .whisper: return WhisperLanguage.all.dropFirst().map(\.code)
+            }
+        }
+
+        var offersLanguagePicker: Bool { !languageCodes.isEmpty }
+
+        // The shared dictation language clamped to what this engine supports;
+        // "" = auto-detect. A code the engine can't do falls back to auto.
+        func clampedLanguage(_ code: String) -> String {
+            code.isEmpty || languageCodes.contains(code) ? code : ""
+        }
     }
 
-    enum HotkeyMode: String, Codable, CaseIterable, Identifiable {
-        case holdToTalk
-        case toggle
+    // How a dictation trigger is activated. Replaces the old single global
+    // "hold vs toggle" mode: each trigger now carries its own gesture, so the
+    // user can bind e.g. Right Option to hold-to-talk and a second key to
+    // double-tap toggle.
+    enum Gesture: String, Codable, CaseIterable, Identifiable {
+        case hold
+        case tapToggle
+        case doubleTapToggle
         var id: String { rawValue }
         var label: String {
             switch self {
-            case .holdToTalk: return "Hold to talk"
-            case .toggle: return "Tap to toggle"
+            case .hold: return "Hold to talk"
+            case .tapToggle: return "Tap to toggle"
+            case .doubleTapToggle: return "Double-tap to toggle"
             }
         }
     }
 
-    @Published var hotkey: Hotkey {
-        didSet { persistHotkey() }
-    }
-
-    @Published var hotkeyMode: HotkeyMode {
-        didSet { defaults.set(hotkeyMode.rawValue, forKey: Keys.hotkeyMode) }
+    // The dictation triggers (max 2). Each is a key + a gesture, both routed to
+    // the same dictation state machine. Persisted as JSON; migrated from the
+    // legacy single `hotkey` + `hotkeyMode` on first launch after upgrade.
+    @Published var dictationTrigger: DictationTrigger {
+        didSet { persistDictationTrigger() }
     }
 
     // Stable UID of the input device to record from; "" means the system default.
@@ -253,6 +308,13 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(soundCues, forKey: Keys.soundCues) }
     }
 
+    // Pause / mute other apps' audio while recording a dictation. Off by
+    // default. Applies to dictation only - meeting mode captures system audio
+    // on purpose, so it's never touched.
+    @Published var recordingAudio: RecordingAudio {
+        didSet { defaults.set(recordingAudio.rawValue, forKey: Keys.recordingAudio) }
+    }
+
     // Whisper-only: when on, transcription runs the X→English translate task
     // instead of plain same-language transcription. Inert on Parakeet and on
     // Whisper models that can't translate (turbo / English-only) — the
@@ -268,6 +330,15 @@ final class SettingsStore: ObservableObject {
     // is on; valid values are WhisperLanguage codes.
     @Published var translationSourceLanguage: String {
         didSet { defaults.set(translationSourceLanguage, forKey: Keys.translationSourceLanguage) }
+    }
+
+    // The language you dictate in, shared across engines (ISO 639-1 code; ""
+    // = auto-detect). Each engine clamps it to what it supports: Whisper 100+,
+    // Nemotron 6 (latin), Parakeet v3 ~28 European; Parakeet v2 ignores it
+    // (English-only). Whisper uses it for both transcription and the translate
+    // source language.
+    @Published var dictationLanguage: String {
+        didSet { defaults.set(dictationLanguage, forKey: Keys.dictationLanguage) }
     }
 
     // Smart typing = real-time streaming + word-by-word insertion at the
@@ -354,15 +425,27 @@ final class SettingsStore: ObservableObject {
     private let defaults = UserDefaults.standard
 
     private init() {
-        let storedKey = defaults.object(forKey: Keys.hotkeyKeyCode) as? Int
-        let storedMods = defaults.object(forKey: Keys.hotkeyModifiers) as? UInt
-        self.hotkey = Hotkey(
-            keyCode: storedKey.map { Int64($0) },
-            modifiers: storedMods.map { CGEventFlags(rawValue: UInt64($0)) }
-                ?? Hotkey.defaultRightOption.modifiers
-        )
-        let storedMode = defaults.string(forKey: Keys.hotkeyMode) ?? HotkeyMode.holdToTalk.rawValue
-        self.hotkeyMode = HotkeyMode(rawValue: storedMode) ?? .holdToTalk
+        if let data = defaults.data(forKey: Keys.dictationTrigger),
+            let decoded = try? JSONDecoder().decode(DictationTrigger.self, from: data)
+        {
+            self.dictationTrigger = decoded
+        } else if let data = defaults.data(forKey: Keys.dictationTriggersArray),
+            let first = (try? JSONDecoder().decode([DictationTrigger].self, from: data))?.first
+        {
+            // Migrate from the short-lived two-trigger array: keep the first.
+            self.dictationTrigger = first
+        } else {
+            // First launch after upgrade (or a clean install): fold the legacy
+            // single hotkey + mode into one trigger. `nil`/`nil` means nothing
+            // was ever stored -> seed the documented Right Option default.
+            let legacyKey = defaults.object(forKey: Keys.hotkeyKeyCode) as? Int
+            let legacyMods = defaults.object(forKey: Keys.hotkeyModifiers) as? UInt
+            self.dictationTrigger = DictationTrigger.migrate(
+                legacyKeyCode: legacyKey.map { Int64($0) },
+                legacyModifiers: legacyMods.map { UInt64($0) },
+                legacyMode: defaults.string(forKey: Keys.hotkeyMode)
+            )
+        }
         self.inputDeviceUID = defaults.string(forKey: Keys.inputDeviceUID) ?? ""
         self.modelName = defaults.string(forKey: Keys.modelName) ?? ModelManager.defaultModel
         self.autoPaste = defaults.object(forKey: Keys.autoPaste) as? Bool ?? true
@@ -380,8 +463,16 @@ final class SettingsStore: ObservableObject {
         self.llmPostProcessLevel = LLMPostProcessLevel(rawValue: storedLLMLevel) ?? .off
         self.llmCustomInstructions = defaults.string(forKey: Keys.llmCustomInstructions) ?? ""
         self.soundCues = defaults.object(forKey: Keys.soundCues) as? Bool ?? true
+        let storedRecordingAudio =
+            defaults.string(forKey: Keys.recordingAudio) ?? RecordingAudio.nothing.rawValue
+        self.recordingAudio = RecordingAudio(rawValue: storedRecordingAudio) ?? .nothing
         self.translateToEnglish = defaults.object(forKey: Keys.translateToEnglish) as? Bool ?? false
         self.translationSourceLanguage = defaults.string(forKey: Keys.translationSourceLanguage) ?? ""
+        // Seed from the legacy Whisper source-language pin so an existing choice
+        // carries over the first time this shared setting appears.
+        self.dictationLanguage =
+            defaults.string(forKey: Keys.dictationLanguage)
+            ?? defaults.string(forKey: Keys.translationSourceLanguage) ?? ""
         self.smartTyping = defaults.object(forKey: Keys.smartTyping) as? Bool ?? false
         self.voiceCommands = defaults.object(forKey: Keys.voiceCommands) as? Bool ?? true
         self.trimFillers = defaults.object(forKey: Keys.trimFillers) as? Bool ?? true
@@ -428,11 +519,6 @@ final class SettingsStore: ObservableObject {
         self.meetingEnabled = defaults.object(forKey: Keys.meetingEnabled) as? Bool ?? false
         self.showMeetingHUD = defaults.object(forKey: Keys.showMeetingHUD) as? Bool ?? true
         self.voiceEditEnabled = defaults.object(forKey: Keys.voiceEditEnabled) as? Bool ?? false
-
-        // Seed the defaults so a fresh launch lands on the documented hotkey even if nothing was stored yet.
-        if storedKey == nil && storedMods == nil {
-            self.hotkey = Hotkey.defaultRightOption
-        }
     }
 
     // Returns every user-facing preference to its first-launch defaults.
@@ -440,8 +526,7 @@ final class SettingsStore: ObservableObject {
     // (downloaded models) alone - the user can clear those explicitly via
     // the model rows. didSet on each @Published var handles persistence.
     func resetToDefaults() {
-        hotkey = .defaultRightOption
-        hotkeyMode = .holdToTalk
+        dictationTrigger = DictationTrigger(hotkey: .defaultRightOption, gesture: .hold)
         inputDeviceUID = ""
         meetingHotkey = .defaultMeeting
         voiceEditHotkey = .defaultVoiceEdit
@@ -454,9 +539,11 @@ final class SettingsStore: ObservableObject {
         llmPostProcessLevel = .off
         llmCustomInstructions = ""
         soundCues = true
+        recordingAudio = .nothing
         modelName = ModelManager.defaultModel
         translateToEnglish = false
         translationSourceLanguage = ""
+        dictationLanguage = ""
         autoPaste = true
         smartTyping = false
         voiceCommands = true
@@ -469,13 +556,9 @@ final class SettingsStore: ObservableObject {
         customFillerWords = []
     }
 
-    private func persistHotkey() {
-        if let keyCode = hotkey.keyCode {
-            defaults.set(Int(keyCode), forKey: Keys.hotkeyKeyCode)
-        } else {
-            defaults.removeObject(forKey: Keys.hotkeyKeyCode)
-        }
-        defaults.set(UInt(hotkey.modifiers.rawValue), forKey: Keys.hotkeyModifiers)
+    private func persistDictationTrigger() {
+        guard let data = try? JSONEncoder().encode(dictationTrigger) else { return }
+        defaults.set(data, forKey: Keys.dictationTrigger)
     }
 
     private func persistMeetingHotkey() {
@@ -497,15 +580,59 @@ final class SettingsStore: ObservableObject {
     }
 }
 
+// The dictation trigger: a key + the gesture that activates it (see AppCoordinator).
+struct DictationTrigger: Codable, Equatable {
+    var hotkey: Hotkey
+    var gesture: SettingsStore.Gesture
+
+    // Fold the pre-0.4 single hotkey + global mode into a trigger.
+    // `legacyKeyCode`/`legacyModifiers` are nil when nothing was stored, which
+    // means a clean install -> seed the documented Right Option default. Pure
+    // and total so it can be unit-tested without the UserDefaults singleton.
+    static func migrate(
+        legacyKeyCode: Int64?, legacyModifiers: UInt64?, legacyMode: String?
+    ) -> DictationTrigger {
+        let hotkey: Hotkey
+        if legacyKeyCode == nil && legacyModifiers == nil {
+            hotkey = .defaultRightOption
+        } else {
+            hotkey = Hotkey(
+                keyCode: legacyKeyCode,
+                modifiers: legacyModifiers.map { CGEventFlags(rawValue: $0) }
+                    ?? Hotkey.defaultRightOption.modifiers
+            )
+        }
+        let gesture: SettingsStore.Gesture = (legacyMode == "toggle") ? .tapToggle : .hold
+        return DictationTrigger(hotkey: hotkey, gesture: gesture)
+    }
+}
+
 // A hotkey is either:
 //   - bare modifiers (keyCode == nil, modifiers != 0)            e.g. hold Right Option
 //   - modifiers + key (both present)                              e.g. ⌃⌥ Space
 //   - bare key (keyCode != nil, modifiers == 0)                   e.g. F5
-struct Hotkey: Equatable {
+struct Hotkey: Equatable, Codable {
     var keyCode: Int64?
     var modifiers: CGEventFlags
 
     var isBareModifier: Bool { keyCode == nil && !modifiers.isEmpty }
+
+    // CGEventFlags is an OptionSet, not Codable; round-trip it via its rawValue.
+    private enum CodingKeys: String, CodingKey { case keyCode, modifiers }
+    init(keyCode: Int64?, modifiers: CGEventFlags) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        keyCode = try c.decodeIfPresent(Int64.self, forKey: .keyCode)
+        modifiers = CGEventFlags(rawValue: try c.decode(UInt64.self, forKey: .modifiers))
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(keyCode, forKey: .keyCode)
+        try c.encode(modifiers.rawValue, forKey: .modifiers)
+    }
 
     static let defaultRightOption = Hotkey(
         keyCode: nil,

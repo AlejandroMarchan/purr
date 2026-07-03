@@ -68,6 +68,14 @@ final class AppCoordinator: ObservableObject {
                     "State: \(String(describing: oldValue), privacy: .public) -> \(String(describing: self.state), privacy: .public)"
                 )
             }
+            // Catch-all restore for paths that quiet the audio but never reach
+            // finishRecording/cancelDictation - the streaming-startup abort and
+            // the error transitions. No-op on the normal path (those already
+            // restored and reset activeAudioAction to .none).
+            switch state {
+            case .idle, .error: restoreAudioIfNeeded()
+            case .recording, .transcribing: break
+            }
             refreshSafeToQuit()
             refreshMenuBarStatus()
         }
@@ -154,6 +162,13 @@ final class AppCoordinator: ObservableObject {
     // trailing-space insert knows to stay silent - Esc means no further
     // insertion, full stop.
     private var streamingCancelledByUser = false
+
+    // What we did to other apps' audio at this dictation's start, so we undo
+    // exactly that on stop (see SettingsStore.recordingAudio / MediaController).
+    // .muted carries the device's prior mute flag so we restore it, not just
+    // clear it.
+    private enum ActiveAudioAction { case none, muted(wasMuted: Bool) }
+    private var activeAudioAction: ActiveAudioAction = .none
 
     // Quit callback delivered by AppDelegate. Stored so the global tap hotkey
     // can drive the same code path as the status-bar Quit menu item.
@@ -272,6 +287,12 @@ final class AppCoordinator: ObservableObject {
 
     func reinstallHotkey() {
         installHotkeys()
+    }
+
+    // While the Settings hotkey recorder is listening, mute the live tap so the
+    // keys the user presses to bind a hotkey don't also fire dictation.
+    func setHotkeyCapture(active: Bool) {
+        hotkey.setPaused(active)
     }
 
     // Refuses while a meeting is in flight so we don't pull the mmap out from under the running session.
@@ -505,14 +526,18 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func installHotkeys() {
+        // Reinstalling (e.g. after the user edits a trigger) must not leave a
+        // stale lock or armed timer from the previous binding set behind.
+        resetDictationGestureState()
         hotkey.onEscape = { [weak self] in self?.cancelDictation() }
         let s = SettingsStore.shared
+        let trigger = s.dictationTrigger
         var bindings: [HotkeyManager.Binding] = [
             .init(
                 action: .transcribe,
-                hotkey: s.hotkey,
-                onPress: { [weak self] in self?.handleTranscribePress() },
-                onRelease: { [weak self] in self?.handleTranscribeRelease() }
+                hotkey: trigger.hotkey,
+                onPress: { [weak self] in self?.handleTranscribePress(gesture: trigger.gesture) },
+                onRelease: { [weak self] in self?.handleTranscribeRelease(gesture: trigger.gesture) }
             )
         ]
         if s.meetingEnabled {
@@ -635,12 +660,24 @@ final class AppCoordinator: ObservableObject {
         return false
     }
 
-    // Double-tap hands-free lock (hold-to-talk only). The arbiter owns the
+    // Double-tap hands-free lock (hold gesture only). The arbiter owns the
     // timing rules; pendingHoldStop is the deferred-stop timer it arms.
     private var handsFree = HandsFreeLock()
     private var pendingHoldStop: Task<Void, Never>?
+    // Armed first-tap timer for the double-tap-toggle gesture.
+    private var doubleTapPending: Task<Void, Never>?
 
-    private func handleTranscribePress() {
+    // Clears every transient dictation-gesture timer/lock. Called before a
+    // reinstall so a gesture in flight can't stop a recording started under a
+    // different binding moments later.
+    private func resetDictationGestureState() {
+        handsFree.reset()
+        cancelPendingHoldStop()
+        doubleTapPending?.cancel()
+        doubleTapPending = nil
+    }
+
+    private func handleTranscribePress(gesture: SettingsStore.Gesture) {
         if hud.shouldIgnorePress(whileBusy: dictationBusy) {
             log.info("Transcribe press ignored: HUD message up or transcription in flight.")
             return
@@ -655,10 +692,10 @@ final class AppCoordinator: ObservableObject {
             Task { await LlamaRuntime.shared.warmUp() }
         }
         log.info(
-            "Transcribe press received (state=\(String(describing: self.state), privacy: .public), mode=\(SettingsStore.shared.hotkeyMode.rawValue, privacy: .public))"
+            "Transcribe press received (state=\(String(describing: self.state), privacy: .public), gesture=\(gesture.rawValue, privacy: .public))"
         )
-        switch SettingsStore.shared.hotkeyMode {
-        case .holdToTalk:
+        switch gesture {
+        case .hold:
             switch handsFree.press(at: ContinuousClock.now, recordingAlive: dictationAlive) {
             case .begin:
                 cancelPendingHoldStop()
@@ -672,20 +709,43 @@ final class AppCoordinator: ObservableObject {
             case .stop:
                 performHoldStop()
             }
-        case .toggle:
-            switch state {
-            case .idle, .error: beginRecording()
-            case .recording: Task { await finishRecording() }
-            case .transcribing: break
+        case .tapToggle:
+            toggleDictation()
+        case .doubleTapToggle:
+            handleDoubleTapToggle()
+        }
+    }
+
+    // One-tap start/stop, shared by tap-toggle and the completed double-tap.
+    private func toggleDictation() {
+        switch state {
+        case .idle, .error: beginRecording()
+        case .recording: Task { await finishRecording() }
+        case .transcribing: break
+        }
+    }
+
+    // Toggle on the second of two taps within the double-tap window; a lone tap
+    // just arms (and later disarms) the timer, doing nothing.
+    private func handleDoubleTapToggle() {
+        if let pending = doubleTapPending {
+            pending.cancel()
+            doubleTapPending = nil
+            toggleDictation()
+        } else {
+            doubleTapPending = Task { [weak self] in
+                try? await Task.sleep(for: HandsFreeLock.secondPressWindow)
+                guard let self, !Task.isCancelled else { return }
+                self.doubleTapPending = nil
             }
         }
     }
 
-    private func handleTranscribeRelease() {
+    private func handleTranscribeRelease(gesture: SettingsStore.Gesture) {
+        guard gesture == .hold else { return }
         log.info(
             "Transcribe release received (state=\(String(describing: self.state), privacy: .public), startupInFlight=\(self.streamingStartupInFlight, privacy: .public))"
         )
-        guard SettingsStore.shared.hotkeyMode == .holdToTalk else { return }
         switch handsFree.release(at: ContinuousClock.now) {
         case .ignore:
             break
@@ -705,14 +765,6 @@ final class AppCoordinator: ObservableObject {
     }
 
     private var dictationAlive: Bool { state == .recording || streamingStartupInFlight }
-
-    // A hotkey-mode switch mid-gesture must not leave a lock or an armed
-    // deferred stop behind: a stale timer could otherwise stop a dictation
-    // started moments later in toggle mode.
-    func hotkeyModeChanged() {
-        handsFree.reset()
-        cancelPendingHoldStop()
-    }
 
     private func cancelPendingHoldStop() {
         pendingHoldStop?.cancel()
@@ -751,6 +803,12 @@ final class AppCoordinator: ObservableObject {
         // setup Task and leaving an orphaned session behind.
         if streamingStartupInFlight { return }
 
+        // Mute other apps' audio for the duration of this dictation.
+        switch SettingsStore.shared.recordingAudio {
+        case .nothing: break
+        case .mute: if let wasMuted = MediaController.mute() { activeAudioAction = .muted(wasMuted: wasMuted) }
+        }
+
         if shouldStreamThisRecording() {
             beginStreamingRecording()
         } else {
@@ -758,11 +816,24 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    // Undo whatever we did to other apps' audio at the start of this dictation.
+    // Idempotent (resets to .none), so the stop/cancel paths can call it for an
+    // instant restore while the state didSet stays as a catch-all for the abort
+    // and error paths that never reach here.
+    private func restoreAudioIfNeeded() {
+        switch activeAudioAction {
+        case .none: return
+        case .muted(let wasMuted): MediaController.setMuted(wasMuted)
+        }
+        activeAudioAction = .none
+    }
+
     private func finishRecording() async {
         // After an Esc cancel the hotkey release still arrives; the recorder
         // is already stopped and the Cancelled message is on the HUD - a
         // stale finish must not wipe it or re-enter the batch flow.
         guard state == .recording else { return }
+        restoreAudioIfNeeded()
         SoundCues.play(.recordingStopped)
         if streamingSession != nil {
             await finishStreamingRecording()
@@ -780,6 +851,7 @@ final class AppCoordinator: ObservableObject {
         // deferred stop so the next press reads as a fresh start.
         handsFree.reset()
         cancelPendingHoldStop()
+        restoreAudioIfNeeded()
         SoundCues.play(.dictationCancelled)
         if streamingSession != nil {
             // Close the TOCTOU window before the async teardown: the hotkey

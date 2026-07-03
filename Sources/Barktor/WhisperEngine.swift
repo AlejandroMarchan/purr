@@ -87,11 +87,11 @@ final class WhisperEngine: TranscriptionEngine {
         let translate =
             SettingsStore.shared.translateToEnglish
             && ModelManager.supportsTranslation(modelIdentifier)
-        // When translating, a pinned source language skips Whisper's
-        // audio-based detection, which is unreliable on short clips. Empty
-        // string means auto-detect; plain transcription always auto-detects.
-        let sourceLanguage = SettingsStore.shared.translationSourceLanguage
-        let language: String? = (translate && !sourceLanguage.isEmpty) ? sourceLanguage : nil
+        // The shared dictation language (ISO code, "" = auto-detect) pins both
+        // the transcription language and the translate source, so a short clip
+        // isn't misdetected. Empty = Whisper auto-detects.
+        let pinned = SettingsStore.shared.dictationLanguage
+        let language: String? = pinned.isEmpty ? nil : pinned
         let options = DecodingOptions(
             verbose: false,
             task: translate ? .translate : .transcribe,

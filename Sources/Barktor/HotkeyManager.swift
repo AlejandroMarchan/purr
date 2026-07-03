@@ -34,11 +34,14 @@ final class HotkeyManager {
     private var bindings: [Binding] = []
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    // Per-binding press state, keyed by Action, so two bindings can be
-    // observed independently (e.g. user holds voice-edit while dictation
-    // is in toggle mode - they shouldn't interfere).
-    private var heldDown: [Action: Bool] = [:]
+    // Per-binding press state, keyed by binding index (parallel to `bindings`),
+    // so every binding is observed independently. Index rather than Action
+    // because the two dictation triggers share `action == .transcribe` yet
+    // must track their own held state.
+    private var heldDown: [Bool] = []
     private var dictationSuspended = false
+    // While true the tap is disabled and every event is ignored (see setPaused).
+    private var paused = false
 
     private let log = Logger(subsystem: "com.naktor.barktor", category: "hotkey")
 
@@ -64,7 +67,7 @@ final class HotkeyManager {
 
     func setBindings(_ new: [Binding]) {
         self.bindings = new
-        self.heldDown = Dictionary(uniqueKeysWithValues: new.map { ($0.action, false) })
+        self.heldDown = Array(repeating: false, count: new.count)
     }
 
     // Silences the dictation hotkey only (meeting + voice-edit still
@@ -72,11 +75,27 @@ final class HotkeyManager {
     // accidentally insert a batch transcript into a window.
     func suspendDictation(_ suspend: Bool) {
         dictationSuspended = suspend
-        if suspend { heldDown[.transcribe] = false }
+        if suspend {
+            for i in bindings.indices where bindings[i].action == .transcribe { heldDown[i] = false }
+        }
+    }
+
+    // Fully mutes every binding by disabling the tap outright. Used while the
+    // user is recording a *new* hotkey in Settings, so pressing keys to bind
+    // one doesn't also fire dictation/meeting/quit through the live tap. The
+    // Settings recorder listens via a separate local NSEvent monitor, which is
+    // unaffected by this.
+    func setPaused(_ paused: Bool) {
+        self.paused = paused
+        if let tap { CGEvent.tapEnable(tap: tap, enable: !paused) }
+        if paused { for i in heldDown.indices { heldDown[i] = false } }
     }
 
     func install() {
         uninstall()
+        // A fresh tap is always live; a reinstall (e.g. after a hotkey was just
+        // recorded) clears any leftover paused state.
+        paused = false
 
         let mask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
@@ -121,7 +140,7 @@ final class HotkeyManager {
         }
         tap = nil
         runLoopSource = nil
-        heldDown = heldDown.mapValues { _ in false }
+        for i in heldDown.indices { heldDown[i] = false }
     }
 
     // ------------------------------------------------------------------
@@ -129,6 +148,10 @@ final class HotkeyManager {
     // ------------------------------------------------------------------
 
     private func handle(type: CGEventType, event: CGEvent) {
+        // Paused for hotkey capture: ignore everything, and don't fight the
+        // deliberate disable by re-enabling on the disabled-callback.
+        if paused { return }
+
         // The OS occasionally disables our tap (timeout, backgrounded
         // dispatch, system sleep). Re-enable and move on.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -143,17 +166,19 @@ final class HotkeyManager {
             DispatchQueue.main.async { [weak self] in self?.onEscape?() }
         }
 
-        for binding in bindings {
+        for (index, binding) in bindings.enumerated() {
             if dictationSuspended, binding.action == .transcribe { continue }
             if binding.hotkey.isBareModifier {
-                handleBareModifier(type: type, event: event, binding: binding)
+                handleBareModifier(type: type, event: event, index: index, binding: binding)
             } else {
-                handleKeyCombination(type: type, event: event, binding: binding)
+                handleKeyCombination(type: type, event: event, index: index, binding: binding)
             }
         }
     }
 
-    private func handleBareModifier(type: CGEventType, event: CGEvent, binding: Binding) {
+    private func handleBareModifier(
+        type: CGEventType, event: CGEvent, index: Int, binding: Binding
+    ) {
         // Only flagsChanged events carry meaningful info for bare modifiers.
         guard type == .flagsChanged else { return }
 
@@ -163,15 +188,15 @@ final class HotkeyManager {
 
         let modifierBit = bareModifierBit(binding.hotkey)
         let isDown = event.flags.contains(modifierBit)
-        let wasDown = heldDown[binding.action] ?? false
+        let wasDown = heldDown[index]
 
         if isDown && !wasDown {
-            heldDown[binding.action] = true
+            heldDown[index] = true
             log.debug(
                 "Bare-modifier press: action=\(String(describing: binding.action), privacy: .public)")
             DispatchQueue.main.async { binding.onPress() }
         } else if !isDown && wasDown {
-            heldDown[binding.action] = false
+            heldDown[index] = false
             log.debug(
                 "Bare-modifier release: action=\(String(describing: binding.action), privacy: .public)"
             )
@@ -179,14 +204,16 @@ final class HotkeyManager {
         }
     }
 
-    private func handleKeyCombination(type: CGEventType, event: CGEvent, binding: Binding) {
+    private func handleKeyCombination(
+        type: CGEventType, event: CGEvent, index: Int, binding: Binding
+    ) {
         guard let targetKeyCode = binding.hotkey.keyCode else { return }
         guard type == .keyDown || type == .keyUp else { return }
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         guard keyCode == targetKeyCode else { return }
 
-        let wasDown = heldDown[binding.action] ?? false
+        let wasDown = heldDown[index]
 
         if type == .keyUp {
             // A keyUp ends the hold whenever this binding is currently
@@ -196,7 +223,7 @@ final class HotkeyManager {
             // flags; an exact modifier match here would strand the binding
             // permanently "held" and never call onRelease.
             guard wasDown else { return }
-            heldDown[binding.action] = false
+            heldDown[index] = false
             log.debug(
                 "Combo release: action=\(String(describing: binding.action), privacy: .public)")
             DispatchQueue.main.async { binding.onRelease() }
@@ -210,7 +237,7 @@ final class HotkeyManager {
         guard active == required else { return }
 
         if wasDown { return }
-        heldDown[binding.action] = true
+        heldDown[index] = true
         log.debug("Combo press: action=\(String(describing: binding.action), privacy: .public)")
         DispatchQueue.main.async { binding.onPress() }
     }
