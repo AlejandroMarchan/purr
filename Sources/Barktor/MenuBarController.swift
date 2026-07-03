@@ -1,9 +1,9 @@
 import AppKit
 import Combine
 
-// NSStatusItem-based menu bar surface. Icon reflects coordinator state so a
-// glance at the top-right of the screen tells you whether Barktor is idle,
-// recording, or transcribing - even when the floating HUD is dismissed.
+// NSStatusItem-based menu bar surface. The icon stays idle for per-press
+// dictation (the floating HUD signals that) and only changes for the two
+// states worth a glance across the screen: a meeting recording, or an error.
 @MainActor
 final class MenuBarController {
     private let statusItem: NSStatusItem
@@ -18,11 +18,10 @@ final class MenuBarController {
     private lazy var iconIdle =
         templateImage(named: "barktor_menubar_glyph", height: 18)
         ?? templateSymbol(named: "mic")
-    private lazy var iconRecording = templateSymbol(named: "mic.fill")
-    // Transcribing and meeting pair the speech glyph with a second symbol so a
-    // glance distinguishes them from plain dictation: mic + waveform while a
-    // transcript is being produced, mic + record-dot while a meeting records.
-    private lazy var iconTranscribing = templateComposite(["mic", "waveform"])
+    // Only meeting and error change the menu-bar glyph; recording and
+    // transcribing keep the idle icon (the HUD pill already signals them, and a
+    // transient icon flip in the corner is noise for little gain). Meeting is
+    // long-running and error is persistent, so both earn a distinct glance.
     private lazy var iconMeeting = templateComposite(["mic.fill", "record.circle.fill"])
     private lazy var iconError = templateSymbol(named: "exclamationmark.triangle")
 
@@ -113,10 +112,10 @@ final class MenuBarController {
             button.image = iconIdle
             button.toolTip = "Barktor - ready"
         case .recording:
-            button.image = iconRecording
+            button.image = iconIdle
             button.toolTip = "Barktor - recording…"
         case .transcribing:
-            button.image = iconTranscribing
+            button.image = iconIdle
             button.toolTip = "Barktor - transcribing…"
         case .meeting:
             button.image = iconMeeting
