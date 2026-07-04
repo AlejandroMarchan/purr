@@ -182,7 +182,7 @@ final class WhisperEngine: TranscriptionEngine {
     ) async rethrows -> T {
         let poller = Task { [weak self] in
             while !Task.isCancelled {
-                if let fraction = await self?.pipe?.progress.fractionCompleted, fraction > 0 {
+                if let fraction = self?.pipe?.progress.fractionCompleted, fraction > 0 {
                     progress(min(1, fraction))
                 }
                 try? await Task.sleep(for: .milliseconds(400))
