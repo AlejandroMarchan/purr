@@ -64,6 +64,18 @@ enum AudioFileDecoder {
             else { throw AudioFileDecoderError.unreadable("could not allocate output buffer") }
             var convertError: NSError?
             let status = converter.convert(to: outBuffer, error: &convertError) { _, outStatus in
+                // AVAudioFile.read(into:frameCount:) throws when called at EOF (0
+                // frames remaining) instead of returning an empty buffer. A
+                // resampling converter routinely calls this block one extra time
+                // after consuming all input to confirm there's nothing left, so
+                // without this guard that expected EOF probe surfaces as a fatal
+                // read error — discarding output the converter already produced
+                // in this same convert() call. Checking remaining frames up front
+                // lets us signal .endOfStream directly instead of reading past it.
+                guard file.framePosition < file.length else {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
                 do {
                     inBuffer.frameLength = 0
                     try file.read(into: inBuffer, frameCount: inCapacity)
