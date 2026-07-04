@@ -290,6 +290,12 @@ private struct HistoryRow: View {
             case .interrupted:
                 Label("Interrupted", systemImage: "bolt.horizontal.fill")
                     .font(.caption).foregroundStyle(.orange)
+            case .queued:
+                Label("Queued", systemImage: "clock")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .transcribing:
+                Label("Transcribing…", systemImage: "waveform")
+                    .font(.caption).foregroundStyle(.secondary)
             case .cancelled:
                 Label("Cancelled", systemImage: "xmark.circle")
                     .font(.caption).foregroundStyle(.secondary)
