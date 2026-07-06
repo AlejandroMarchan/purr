@@ -172,6 +172,23 @@ final class HistoryStore: ObservableObject {
         if changed { save() }
     }
 
+    // Queue-crash cleanup, called from TranscriptionQueue.scanAndResume():
+    // entries left in .queued/.transcribing whose backing job no longer
+    // exists can never complete — surface them as failed instead of leaving
+    // zombie spinners in the list.
+    func failOrphanedQueueEntries(activeIDs: Set<UUID>) {
+        var changed = false
+        for idx in entries.indices {
+            let status = entries[idx].status
+            guard status == .queued || status == .transcribing else { continue }
+            guard !activeIDs.contains(entries[idx].id) else { continue }
+            entries[idx].status = .failed
+            entries[idx].errorMessage = "Interrupted before transcription finished."
+            changed = true
+        }
+        if changed { save() }
+    }
+
     func startDailySweeps() {
         sweepTask?.cancel()
         sweepTask = Task { [weak self] in

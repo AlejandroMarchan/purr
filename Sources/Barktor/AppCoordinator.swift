@@ -11,17 +11,18 @@ import os.log
 // * **Dictation (transcribe)** - record while hotkey held, on release run
 //   either batch transcribe + paste or EOU streaming + live typing.
 //   Decided per-press by `shouldStreamThisRecording()`.
-// * **Meeting** - tap-to-toggle long-form recording with offline diarize
-//   on stop, written to a Markdown file. Lives in `MeetingPipeline`.
+// * **Meeting** - tap-to-toggle long-form recording; on stop the audio is
+//   persisted and handed to the background `TranscriptionQueue` (diarize,
+//   ASR, document, summary all run there). Lives in `MeetingPipeline`.
 // * **Voice edit** - hold while text is selected; transcribed speech is
 //   parsed as an edit instruction and applied via Accessibility (or paste
 //   fallback). Lives in `VoiceEditor`.
 //
 // While a meeting is recording, dictation is suspended at the hotkey
 // layer - accidentally inserting batch transcripts mid-meeting would be
-// bad. Voice-edit is independent and can fire any time the meeting isn't
-// actively processing (see handleVoiceEditPress()) - during processing it
-// may share the same WhisperEngine instance as the meeting transcription.
+// bad. Voice-edit is independent and can fire any time - the queue never
+// borrows the live dictation/voice-edit engine, so there's no shared-pipe
+// hazard to gate against.
 @MainActor
 final class AppCoordinator: ObservableObject {
     enum State: Equatable {
@@ -39,6 +40,7 @@ final class AppCoordinator: ObservableObject {
         case recording
         case transcribing
         case meeting
+        case queueProcessing
         case error(String)
     }
 
@@ -132,11 +134,18 @@ final class AppCoordinator: ObservableObject {
     // Nemotron multilingual streaming — the only multilingual engine that
     // supports Smart Typing (Parakeet v3 and Whisper are batch-only).
     private var nemotron = NemotronStreamingEngine()
+    // Owned here (not by MeetingPipeline) since the queue is what diarizes
+    // now; Settings' download/unload flows reach it through the coordinator.
+    private let diarizer = Diarizer()
     private let summarizer = MeetingSummarizer.shared
     private var meeting: MeetingPipeline!
     private var voiceEditor: VoiceEditor!
     private var meetingObserver: AnyCancellable?
     private var voiceEditObserver: AnyCancellable?
+    private var queueObserver: AnyCancellable?
+    // True while the queue is processing or has jobs waiting; feeds the
+    // menu-bar glyph when nothing foreground is active.
+    private var queueActive = false
 
     // Recordings shorter than this are accidental taps - not worth an entry.
     private static let minKeepSamples = 16_000 * 4 / 10
@@ -226,13 +235,7 @@ final class AppCoordinator: ObservableObject {
         HistoryStore.shared.retentionProvider = { SettingsStore.shared.historyAudioRetention }
         HistoryStore.shared.startDailySweeps()
 
-        meeting = MeetingPipeline(
-            hud: hud,
-            summarizer: summarizer,
-            engineProvider: { [weak self] in
-                self?.currentMeetingEngine() ?? (ParakeetEngine(), "Parakeet TDT v2")
-            }
-        )
+        meeting = MeetingPipeline(hud: hud, queue: TranscriptionQueue.shared)
         voiceEditor = VoiceEditor(hud: hud) { [weak self] in
             // Voice-edit always uses whichever engine the user has selected
             // - they may want fast Tiny EN for edits even if Parakeet is
@@ -245,7 +248,7 @@ final class AppCoordinator: ObservableObject {
         meetingObserver = meeting.$state.sink { [weak self] state in
             guard let self else { return }
             switch state {
-            case .recording, .processing:
+            case .recording:
                 self.hotkey.suspendDictation(true)
                 self.meetingActive = true
             case .idle, .error:
@@ -268,6 +271,46 @@ final class AppCoordinator: ObservableObject {
         installHotkeys()
         // Eager warmup so the first press doesn't pay model-load cost.
         Task { await engine.warmup() }
+
+        // Background transcription queue: the coordinator supplies real
+        // engines and pipelines; the queue never touches globals itself.
+        let queue = TranscriptionQueue.shared
+        queue.engineResolver = { [weak self] choice, model in
+            switch choice {
+            case .parakeet:
+                return (self?.parakeet ?? ParakeetEngine(), "Parakeet TDT v2")
+            case .parakeetV3:
+                return (self?.parakeetV3 ?? ParakeetEngine(version: .v3), "Parakeet TDT v3")
+            case .nemotron:
+                return (self?.nemotron ?? NemotronStreamingEngine(), "Multilingual (Nemotron)")
+            case .whisper:
+                // ALWAYS a fresh pipe: the live dictation engine must never
+                // share WhisperKit decoder state with a queue job.
+                return (WhisperEngine(modelName: model), "Whisper (\(model))")
+            }
+        }
+        queue.postProcess = { [weak self] raw, duration in
+            guard let self else { return raw }
+            let processed = self.makePostProcessor().apply(raw).text
+            // LLM polish only for dictation-sized audio; on an hour-long
+            // file it would just burn its 15 s watchdog for nothing.
+            guard duration <= 300 else { return processed }
+            return await LLMPostProcessor.polish(processed)
+        }
+        queue.diarize = { [weak self] samples in
+            guard let self else { return [] }
+            return try await self.diarizer.diarize(samples: samples)
+        }
+        queue.summarize = { url in
+            guard SettingsStore.shared.summarizeMeetings, MeetingSummarizer.canSummarizeNow
+            else { return nil }
+            return try? await MeetingSummarizer.shared.summarize(transcriptURL: url)
+        }
+        queueObserver = queue.$state.sink { [weak self] state in
+            self?.queueActive = state != .idle
+            self?.refreshMenuBarStatus()
+        }
+        queue.scanAndResume()
     }
 
     func reloadEngine() {
@@ -299,10 +342,10 @@ final class AppCoordinator: ObservableObject {
     @discardableResult
     func deleteDiarizationModel() -> DiarizerDeleteResult {
         switch meeting.state {
-        case .recording, .processing: return .busy
+        case .recording: return .busy
         case .idle, .error: break
         }
-        meeting.unloadDiarizer()
+        diarizer.unload()
         do {
             try Diarizer.delete()
         } catch {
@@ -316,7 +359,7 @@ final class AppCoordinator: ObservableObject {
 
     func downloadDiarizationModel() async -> ModelDownloadResult {
         do {
-            try await meeting.downloadDiarizer()
+            try await diarizer.downloadAndWarmup()
             return .ok
         } catch {
             return .failed(error)
@@ -353,7 +396,7 @@ final class AppCoordinator: ObservableObject {
         if streamingSession != nil || streamingStartupInFlight { return .busy }
         if parakeetBatchProgress != nil { return .busy }
         switch meeting.state {
-        case .recording, .processing: return .busy
+        case .recording: return .busy
         case .idle, .error: break
         }
         if voiceEditState != .idle { return .busy }
@@ -384,7 +427,7 @@ final class AppCoordinator: ObservableObject {
         if streamingSession != nil || streamingStartupInFlight { return .busy }
         if nemotronProgress != nil { return .busy }
         switch meeting.state {
-        case .recording, .processing: return .busy
+        case .recording: return .busy
         case .idle, .error: break
         }
         if voiceEditState != .idle { return .busy }
@@ -434,7 +477,7 @@ final class AppCoordinator: ObservableObject {
         // Release every in-memory session so no deleted file stays mmap'd behind
         // a live handle (and so we reclaim the unified memory).
         await summarizer.unload()
-        meeting.unloadDiarizer()
+        diarizer.unload()
         parakeet.unloadStreamingManager()
         parakeet.unloadBatchManager()
         parakeetV3.unloadBatchManager()
@@ -573,23 +616,7 @@ final class AppCoordinator: ObservableObject {
         hotkey.install()
     }
 
-    // currentMeetingEngine() can hand meetings the very same WhisperEngine
-    // instance dictation/voice-edit uses (reused when the Settings model
-    // matches). WhisperKit is a plain class, not an actor - unlike FluidAudio's
-    // AsrManager, it does not serialize concurrent transcribes - so a voice-edit
-    // fired while the meeting pipeline is transcribing would run two
-    // `pipe.transcribe` calls on shared decoder state at once. Block only
-    // `.processing`: meeting transcription is a single batch pass that runs
-    // exclusively there, so `.recording` is safe (mirrors suspendDictation's
-    // silent-ignore behavior - no HUD message, just don't start).
     private func handleVoiceEditPress() {
-        switch meeting.state {
-        case .processing:
-            log.info("Voice-edit press ignored: meeting is processing (shared engine may be busy).")
-            return
-        case .idle, .recording, .error:
-            break
-        }
         voiceEditor.handlePress()
     }
 
@@ -610,7 +637,7 @@ final class AppCoordinator: ObservableObject {
         }
         if let meeting = meeting {
             switch meeting.state {
-            case .recording, .processing: return false
+            case .recording: return false
             case .idle, .error: break
             }
         }
@@ -640,7 +667,7 @@ final class AppCoordinator: ObservableObject {
             switch voiceEditState {
             case .transcribing: return .transcribing
             case .recording: return .recording
-            case .idle: return .idle
+            case .idle: return queueActive ? .queueProcessing : .idle
             }
         }
     }
@@ -1358,51 +1385,83 @@ final class AppCoordinator: ObservableObject {
     }
 
     // Re-runs transcription + post-processing over a history entry's saved
-    // WAV. Updates the entry in place - never types into other apps: the
-    // user's cursor is wherever they left it, not where it was when the
-    // original dictation ran.
+    // WAV, now via the background queue: retries serialize with meetings and
+    // drops, so two Whisper pipes never load at once. beginRetry() survives
+    // purely as a double-enqueue guard; the queue calls endRetry() when the
+    // job finishes (see TranscriptionQueue.processFile).
     func retryHistoryEntry(_ id: UUID, using choice: SettingsStore.Engine) async {
         guard let entry = HistoryStore.shared.entries.first(where: { $0.id == id }),
-            let url = HistoryStore.shared.audioURL(for: entry)
+            HistoryStore.shared.audioURL(for: entry) != nil
         else { return }
         guard HistoryStore.shared.beginRetry(id) else { return }
-        defer { HistoryStore.shared.endRetry(id) }
         do {
-            let samples = try WAVFile.read(url: url)
-            let prepared = AudioPreprocessor.normalize(samples).samples
-            // Retry never borrows the live dictation engine: a dictation can
-            // start while this transcribe is awaiting, and WhisperKit does not
-            // serialize concurrent calls on one instance. Parakeet's shared
-            // instance is safe - FluidAudio's AsrManager is an actor. Retries
-            // are rare enough that a fresh Whisper pipe (lazy-loaded on first
-            // use) is the right price for isolation.
-            let model = SettingsStore.shared.modelName
-            let engine: any TranscriptionEngine
-            switch choice {
-            case .parakeet: engine = parakeet
-            case .parakeetV3: engine = parakeetV3
-            case .nemotron: engine = nemotron
-            case .whisper: engine = WhisperEngine(modelName: model)
-            }
-            let raw = try await engine.transcribe(samples: prepared)
-            let processed = makePostProcessor().apply(raw)
-            // Retry produces what a fresh dictation would under the current
-            // settings, including the optional LLM pass; rawText stays the
-            // untouched ASR output.
-            let polished = await LLMPostProcessor.polish(processed.text)
-            HistoryStore.shared.update(id) {
-                $0.rawText = raw
-                $0.processedText = polished
-                $0.status = .ok
-                $0.errorMessage = nil
-                $0.engineUsed = Self.engineUsedLabel(
-                    engine: choice, modelName: model)
-            }
+            try TranscriptionQueue.shared.enqueueFile(
+                jobID: UUID(), entryID: id,
+                sourceFilename: entry.sourceFilename ?? "dictation",
+                duration: entry.duration,
+                engine: choice, whisperModel: SettingsStore.shared.modelName,
+                isRetry: true)
         } catch {
-            log.error("History retry failed: \(error.localizedDescription, privacy: .public)")
-            HistoryStore.shared.update(id) {
-                $0.status = .failed
-                $0.errorMessage = error.localizedDescription
+            log.error(
+                "Retry enqueue failed: \(error.localizedDescription, privacy: .public)")
+            HistoryStore.shared.endRetry(id)
+        }
+    }
+
+    // B1: audio files dropped on the History window. One .queued entry + one
+    // queue job per file; decode runs off-main (a podcast-sized file takes a
+    // moment). The engine is the MEETING engine at drop time — an external
+    // audio is closer to a meeting than to a dictation, and Retry can rerun
+    // it with any other engine.
+    func importAudioFiles(_ urls: [URL]) async {
+        let queue = TranscriptionQueue.shared
+        for url in urls {
+            let entryID = UUID()
+            let jobID = UUID()
+            let filename = url.lastPathComponent
+            let engineChoice = SettingsStore.shared.meetingEngine
+            let model = SettingsStore.shared.modelName
+            // The .queued row lands before decode even starts (duration 0,
+            // filled in below) — a long decode (podcast-length files) would
+            // otherwise give zero visible feedback in History while it runs.
+            HistoryStore.shared.add(
+                DictationEntry(
+                    id: entryID, date: Date(), duration: 0, rawText: nil,
+                    processedText: nil,
+                    engineUsed: Self.engineUsedLabel(engine: engineChoice, modelName: model),
+                    mode: .batch, status: .queued, errorMessage: nil, audioFilename: nil,
+                    sourceFilename: filename))
+            do {
+                let samples = try await Task.detached(priority: .utility) {
+                    try AudioFileDecoder.decode16kMono(url: url)
+                }.value
+                let duration = TimeInterval(samples.count) / 16_000.0
+                let jobDir = queue.jobDirectory(jobID)
+                try await Task.detached(priority: .utility) {
+                    try FileManager.default.createDirectory(
+                        at: jobDir, withIntermediateDirectories: true)
+                    try WAVFile.write(
+                        samples: samples, to: jobDir.appendingPathComponent("audio.wav"))
+                }.value
+                HistoryStore.shared.update(entryID) { $0.duration = duration }
+                try queue.enqueueFile(
+                    jobID: jobID, entryID: entryID, sourceFilename: filename,
+                    duration: duration, engine: engineChoice, whisperModel: model,
+                    isRetry: false)
+            } catch {
+                log.error(
+                    "Audio import failed for \(filename, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                // The .queued entry above was added before decode started, so
+                // it always exists here (unless the user deleted it out from
+                // under us mid-decode, in which case update() is a harmless
+                // no-op) — update it in place rather than adding a second row
+                // under the same id.
+                try? FileManager.default.removeItem(at: queue.jobDirectory(jobID))
+                HistoryStore.shared.update(entryID) {
+                    $0.status = .failed
+                    $0.errorMessage = error.localizedDescription
+                }
             }
         }
     }
