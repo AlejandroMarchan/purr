@@ -34,6 +34,21 @@ INFO_PLIST    := Resources/Info.plist
 # `xcrun notarytool store-credentials`. Override either on the command line.
 DEV_ID         ?= Developer ID Application: Arun Brahma (5JCFRMC367)
 NOTARY_PROFILE ?= barktor-app
+# `app` signs with the Developer ID + Hardened Runtime for the notarized DMG
+# path. `install` overrides both to the local self-signed cert with NO Hardened
+# Runtime: under the Hardened Runtime, library validation would reject the
+# self-signed llama.framework at launch (the same reason scripts/release.sh
+# omits it). Both are plain ?= overrides so existing callers are unchanged.
+SIGN_ID        ?= $(DEV_ID)
+SIGN_FLAGS     ?= --options runtime --timestamp
+# Local self-signed identity + install destination for `make install`. PREFIX
+# follows the GNU convention - override with `make install PREFIX=~/Applications`
+# to install without sudo. Signing every local build with this SAME identity is
+# what keeps the granted Mic/Accessibility/Input-Monitoring permissions alive
+# across rebuilds (see CLAUDE.md); a differently-signed bundle looks like a new
+# app and forces re-granting all three.
+LOCAL_SIGN_ID  ?= Barktor Local Dev
+PREFIX         ?= /Applications
 # llama.cpp is shipped as an XCFramework binary target. SwiftPM stages
 # the macOS-arm64 slice next to the built executable; we copy that into
 # the bundle's Frameworks/ and add the rpath the executable needs to
@@ -71,9 +86,21 @@ export DEVELOPER_DIR
 # test target relies on the overlay's extra Date/URL formatting.
 CLT_FRAMEWORKS_DIR := /Library/Developer/CommandLineTools/Library/Developer/Frameworks
 
-.PHONY: app run test dmg notarize-app clean
+.PHONY: app run test dmg notarize-app install uninstall clean
 
 app:
+	@# Fail fast with an actionable message if the signing identity is missing,
+	@# rather than a cryptic codesign error after a full build. Mirrors the
+	@# preflight in scripts/release.sh, and covers `run`/`install`/`dmg` too since
+	@# they all build through this target. A fresh public clone has neither the
+	@# maintainer Developer ID nor the shared "Barktor Local Dev" cert, so this is
+	@# the first thing it hits - point it at the local-dev path.
+	@security find-identity -p codesigning -v | grep -qF "$(SIGN_ID)" || { \
+	  echo "error: code-signing identity \"$(SIGN_ID)\" not found in your keychain." >&2; \
+	  echo "  local dev: create a self-signed cert (Keychain Access > Certificate Assistant)," >&2; \
+	  echo "             then \`make install SIGN_ID='Your Cert Name'\`" >&2; \
+	  echo "  release:   \`make dmg DEV_ID='Developer ID Application: …' NOTARY_PROFILE=…\`" >&2; \
+	  exit 1; }
 	swift build -c $(CONFIG) --arch arm64
 	@mkdir -p $(MACOS_DIR) $(RES_DIR) $(FRAMEWORKS_DIR)
 	@cp $(BUILD_DIR)/arm64-apple-macosx/$(CONFIG)/$(APP_NAME) $(MACOS_DIR)/$(APP_NAME)
@@ -99,10 +126,11 @@ app:
 	@install_name_tool -add_rpath @executable_path/../Frameworks $(MACOS_DIR)/$(APP_NAME) 2>/dev/null || true
 	@# Sign the embedded framework first so the nested code is already valid
 	@# when we sign the outer bundle (no --deep: Apple recommends signing
-	@# inside-out for distribution). --options runtime turns on the Hardened
-	@# Runtime that notarization requires; --timestamp adds a secure timestamp.
-	@codesign --force --options runtime --timestamp --sign "$(DEV_ID)" $(FRAMEWORKS_DIR)/llama.framework
-	@codesign --force --options runtime --timestamp --sign "$(DEV_ID)" --entitlements $(ENTITLEMENTS) $(APP_DIR)
+	@# inside-out for distribution). SIGN_FLAGS defaults to --options runtime
+	@# (the Hardened Runtime notarization requires) + --timestamp; `install`
+	@# clears it for the local self-signed path.
+	@codesign --force $(SIGN_FLAGS) --sign "$(SIGN_ID)" $(FRAMEWORKS_DIR)/llama.framework
+	@codesign --force $(SIGN_FLAGS) --sign "$(SIGN_ID)" --entitlements $(ENTITLEMENTS) $(APP_DIR)
 	@# Bump the bundle's mtime. macOS keys its icon/LaunchServices cache on the
 	@# bundle modification date; copying a new AppIcon.icns into an existing
 	@# .app leaves the bundle dir mtime stale, so Finder keeps serving the old
@@ -112,6 +140,30 @@ app:
 
 run: app
 	open $(APP_DIR)
+
+# Build with the local self-signed cert (no Hardened Runtime) and swap the fresh
+# bundle into $(PREFIX), replacing any installed copy - the "compile and replace
+# my running Barktor" loop. Re-signing with the same LOCAL_SIGN_ID keeps TCC
+# permissions intact (see the LOCAL_SIGN_ID comment above). CLT-only machines
+# can't `make app`; use scripts/release.sh there.
+install:
+	$(MAKE) app SIGN_ID="$(LOCAL_SIGN_ID)" SIGN_FLAGS=
+	@# The running menu-bar instance holds a CGEventTap and, sharing the bundle
+	@# id, would just get re-activated (not replaced) if left alive when we
+	@# `open` the new build - so quit it, wait up to 5s, then force-kill.
+	@osascript -e 'quit app "$(APP_NAME)"' 2>/dev/null || true
+	@for i in 1 2 3 4 5; do pgrep -x $(APP_NAME) >/dev/null || break; sleep 1; done
+	@pkill -x $(APP_NAME) 2>/dev/null || true
+	@rm -rf "$(PREFIX)/$(APP_NAME).app"
+	@ditto $(APP_DIR) "$(PREFIX)/$(APP_NAME).app"
+	@open "$(PREFIX)/$(APP_NAME).app"
+	@echo "Installed $(PREFIX)/$(APP_NAME).app (signed \"$(LOCAL_SIGN_ID)\") and relaunched."
+
+uninstall:
+	@osascript -e 'quit app "$(APP_NAME)"' 2>/dev/null || true
+	@pkill -x $(APP_NAME) 2>/dev/null || true
+	rm -rf "$(PREFIX)/$(APP_NAME).app"
+	@echo "Removed $(PREFIX)/$(APP_NAME).app. TCC grants persist in System Settings > Privacy & Security; remove there for a clean slate."
 
 test:
 ifeq ($(wildcard $(DEVELOPER_DIR)),)

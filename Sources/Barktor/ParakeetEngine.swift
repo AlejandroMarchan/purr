@@ -24,7 +24,18 @@ import os.log
 // downloads from HuggingFace the first time the user enables Parakeet.
 @MainActor
 final class ParakeetEngine: TranscriptionEngine {
-    nonisolated let supportsStreaming: Bool = true
+    // v2 is English-only (600M, top English recall) + the EOU streaming model
+    // for Smart Typing. v3 is multilingual (25 European languages incl. Spanish),
+    // batch-only - there is no multilingual EOU streaming model yet, so v3 does
+    // not stream (supportsStreaming == false, consumer falls back to batch).
+    private let version: AsrModelVersion
+    private var versionLabel: String { version == .v2 ? "v2" : "v3" }
+    nonisolated let supportsStreaming: Bool
+
+    init(version: AsrModelVersion = .v2) {
+        self.version = version
+        self.supportsStreaming = (version == .v2)
+    }
 
     private var batchManager: AsrManager?
     // The single in-flight batch download+load. Concurrent callers (an automatic
@@ -54,6 +65,8 @@ final class ParakeetEngine: TranscriptionEngine {
     // live. 160 ms is the fallback if a future user complains about lag.
     private static let streamingChunk: StreamingChunkSize = .ms320
 
+    func isWarm() async -> Bool { batchManager != nil }
+
     func warmup() async {
         do {
             try await downloadAndLoadBatchManager()
@@ -66,8 +79,8 @@ final class ParakeetEngine: TranscriptionEngine {
         // but never downloads it. The ~440 MB download happens exclusively from
         // the Settings Download button, which is what enables the toggle.
         // Detached so the batch path doesn't wait on the load.
-        if SettingsStore.shared.smartTyping, Self.eouIsInstalled(), streamingManager == nil,
-            streamingWarmupTask == nil
+        if version == .v2, SettingsStore.shared.smartTyping, Self.eouIsInstalled(),
+            streamingManager == nil, streamingWarmupTask == nil
         {
             streamingWarmupTask = Task { [weak self] in
                 await self?.loadStreamingManager()
@@ -107,7 +120,7 @@ final class ParakeetEngine: TranscriptionEngine {
     private func loadBatchManager() async throws {
         // Only surface progress when weights will actually be fetched; a
         // load-from-disk on warm-up shouldn't flash "downloading…".
-        let willDownload = !Self.batchIsInstalled()
+        let willDownload = !Self.batchIsInstalled(version)
         if willDownload {
             batchDownloadActive = true
             onBatchProgress?(0)
@@ -126,12 +139,13 @@ final class ParakeetEngine: TranscriptionEngine {
             }
         }
         let models = try await AsrModels.downloadAndLoad(
-            to: Self.batchModelDirectory, version: .v2, progressHandler: progressHandler)
+            to: Self.batchModelDirectory(for: version), version: version,
+            progressHandler: progressHandler)
         let manager = AsrManager(config: .default)
         try await manager.loadModels(models)
         try Task.checkCancellation()
         batchManager = manager
-        log.info("Parakeet TDT v2 downloaded and warmed up.")
+        log.info("Parakeet TDT \(self.versionLabel, privacy: .public) downloaded and warmed up.")
     }
 
     private func loadStreamingManager() async {
@@ -203,19 +217,21 @@ final class ParakeetEngine: TranscriptionEngine {
     // models folder (instead of FluidAudio's default) so every Barktor model sits
     // in one place that uninstalling removes. `downloadAndLoad(to:)` treats
     // this as the model's own directory and writes/reads the CoreML bundles here.
-    static var batchModelDirectory: URL {
-        ModelManager.modelsDirectory.appendingPathComponent("parakeet-tdt-0.6b-v2", isDirectory: true)
+    static func batchModelDirectory(for version: AsrModelVersion = .v2) -> URL {
+        let name = version == .v2 ? "parakeet-tdt-0.6b-v2" : "parakeet-tdt-0.6b-v3"
+        return ModelManager.modelsDirectory.appendingPathComponent(name, isDirectory: true)
     }
 
-    static func batchIsInstalled() -> Bool {
+    static func batchIsInstalled(_ version: AsrModelVersion = .v2) -> Bool {
         guard
-            let contents = try? FileManager.default.contentsOfDirectory(atPath: batchModelDirectory.path)
+            let contents = try? FileManager.default.contentsOfDirectory(
+                atPath: batchModelDirectory(for: version).path)
         else { return false }
         return !contents.isEmpty
     }
 
-    static func batchDelete() throws {
-        let url = batchModelDirectory
+    static func batchDelete(_ version: AsrModelVersion = .v2) throws {
+        let url = batchModelDirectory(for: version)
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
@@ -249,15 +265,23 @@ final class ParakeetEngine: TranscriptionEngine {
     // Returns token timings (dropped by transcribe()) for speaker-segment
     // alignment when merging diarization output.
     //
-    // We run the English-only v2 model (highest English recall on the Open
-    // ASR Leaderboard; non-English dictation uses the Whisper engine instead).
-    // `language: .english` is a no-op on v2 - it only drives v3's multilingual
-    // script-aware token filter - but is left in so the call is correct if the
-    // model version is ever switched back.
+    // v2 is English-only (highest English recall on the Open ASR Leaderboard);
+    // `language: .english` is a no-op there. v3 is multilingual: it honors the
+    // shared dictationLanguage when the user pins one of its ~28 European
+    // languages, and falls back to `nil` (auto-detect, no script filter) for
+    // Auto or a language it can't do.
     func transcribeASR(samples: [Float]) async throws -> ASRResult {
         if batchManager == nil { await warmup() }
         guard let manager = batchManager else { throw EngineError.notLoaded }
         let started = Date()
+        let languageHint: Language?
+        if version == .v2 {
+            languageHint = .english
+        } else {
+            let code = SettingsStore.Engine.parakeetV3.clampedLanguage(
+                SettingsStore.shared.dictationLanguage)
+            languageHint = code.isEmpty ? nil : Language(rawValue: code)
+        }
 
         // Bound the CoreML inference so a stuck decode can never pin the HUD on
         // "Transcribing" forever (upstream purr#1: indefinite hang on an
@@ -274,7 +298,7 @@ final class ParakeetEngine: TranscriptionEngine {
             let result = try await withTimeout(budget) {
                 var state = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
                 return try await manager.transcribe(
-                    samples, decoderState: &state, language: .english)
+                    samples, decoderState: &state, language: languageHint)
             }
             let elapsed = Date().timeIntervalSince(started)
             log.info(
@@ -295,6 +319,10 @@ final class ParakeetEngine: TranscriptionEngine {
     }
 
     func makeStreamingSession() async throws -> any StreamingSession {
+        // Only v2 has the (English-only) EOU streaming model; v3 is batch-only.
+        guard version == .v2 else {
+            throw EngineError.streamingNotSupported(engineName: "Parakeet TDT v3")
+        }
         if let task = streamingWarmupTask {
             await task.value
             streamingWarmupTask = nil
@@ -426,8 +454,9 @@ final class StreamingEouAsrSession: StreamingSession {
 
 // Shared between the @Sendable partial callback (manager actor) and the
 // @MainActor session. NSLock keeps the callback synchronous; an actor
-// would force a Task hop that races finish()'s stream closure.
-private final class PartialDiff: @unchecked Sendable {
+// would force a Task hop that races finish()'s stream closure. Internal (not
+// private) so NemotronStreamingSession reuses the same append-only diff.
+final class PartialDiff: @unchecked Sendable {
     private let lock = NSLock()
     private var lastEmitted: String = ""
 

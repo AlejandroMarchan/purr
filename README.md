@@ -54,10 +54,18 @@ Download `Barktor.dmg` from the [latest release](https://github.com/naktor-solut
 ```bash
 git clone https://github.com/naktor-solutions/barktor.git
 cd barktor
-make app
-mv dist/Barktor.app /Applications/
-open /Applications/Barktor.app
+make install   # builds, code-signs, installs to /Applications, and launches
 ```
+
+`make install` signs the app with a stable local identity (default `Barktor Local Dev`) so macOS remembers your Microphone / Accessibility / Input Monitoring grants across rebuilds instead of re-prompting every time. Create that identity once in **Keychain Access → Certificate Assistant → Create a Certificate** (type *Code Signing*, self-signed), or point it at any signing cert you already have:
+
+```bash
+make install SIGN_ID='Your Cert Name'        # use your own identity
+make install PREFIX=~/Applications           # install without sudo
+make uninstall                               # quit and remove it
+```
+
+Rebuild-and-replace at any time with `make install`; it quits the running instance and swaps in the fresh build. (`make app`/`make run` are the Developer-ID release path and expect that cert — for local dev use `make install`.)
 
 First launch:
 
@@ -200,7 +208,7 @@ macOS can't run cleanup code when an app is dragged to the Trash, so those are t
 
 ## License
 
-Barktor is MIT-licensed, as is the Purr codebase it descends from. Copyright (c) 2026 Arun Brahma. See [LICENSE](LICENSE).
+Barktor is MIT-licensed, as is the Purr codebase it descends from. Copyright (c) 2026 Arun Brahma, Copyright (c) 2026 Naktor Solutions. See [LICENSE](LICENSE).
 
 ### Third-party licenses
 

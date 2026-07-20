@@ -1,3 +1,4 @@
+import FluidAudio
 import SwiftUI
 import os.log
 
@@ -9,6 +10,13 @@ struct SettingsView: View {
     // the EOU card. The card downloads/deletes via the coordinator (so warm-up
     // and the button share one progress source) and writes the result back here.
     @State private var eouInstalled = ParakeetEngine.eouIsInstalled()
+
+    private struct InputDevice: Identifiable {
+        let uid: String
+        let name: String
+        var id: String { uid }
+    }
+    @State private var inputDevices: [InputDevice] = []
     // Shares the one Gemma model with the meeting summary section.
     @StateObject private var voiceEditLLM = LLMSummaryViewModel()
     @StateObject private var launchAtLogin = LaunchAtLogin()
@@ -59,44 +67,81 @@ struct SettingsView: View {
     // General tab - hotkey, mode, behavior toggles
     // ------------------------------------------------------------------
 
+    // Short name for the compact pop-up; the row subtitle carries the detail.
+    private func gestureShort(_ g: SettingsStore.Gesture) -> String {
+        switch g {
+        case .hold: return "Hold"
+        case .tapToggle: return "Tap"
+        case .doubleTapToggle: return "Double-tap"
+        }
+    }
+
+    private func gestureSubtitle(_ g: SettingsStore.Gesture) -> String {
+        switch g {
+        case .hold: return "Hold to dictate, release to stop"
+        case .tapToggle: return "Tap once to start, tap to stop"
+        case .doubleTapToggle: return "Double-tap to start, double-tap to stop"
+        }
+    }
+
     private var generalTab: some View {
         Form {
-            Section("Dictate Mode") {
-                Picker("Trigger", selection: $settings.hotkeyMode) {
-                    ForEach(SettingsStore.HotkeyMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: settings.hotkeyMode) { coordinator.hotkeyModeChanged() }
-
-                if settings.hotkeyMode == .holdToTalk {
-                    Text("Tip: press twice quickly to lock dictation hands-free, then press once to stop.")
-                        .font(.caption)
+            Section("Dictation") {
+                HStack(alignment: .center, spacing: 12) {
+                    Text(gestureSubtitle(settings.dictationTrigger.gesture))
                         .foregroundStyle(.secondary)
+                    Spacer(minLength: 12)
+                    Picker(
+                        "",
+                        selection: Binding(
+                            get: { settings.dictationTrigger.gesture },
+                            set: {
+                                settings.dictationTrigger.gesture = $0
+                                coordinator.reinstallHotkey()
+                            })
+                    ) {
+                        ForEach(SettingsStore.Gesture.allCases) { g in Text(gestureShort(g)).tag(g) }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    HotkeyRecorderField(
+                        hotkey: settings.dictationTrigger.hotkey,
+                        onChange: {
+                            settings.dictationTrigger.hotkey = $0
+                            coordinator.reinstallHotkey()
+                        },
+                        onCapturingChange: { coordinator.setHotkeyCapture(active: $0) }
+                    )
                 }
+                .padding(.vertical, 4)
+                if settings.dictationTrigger.gesture == .hold {
+                    Text(
+                        "Tip: press twice quickly to lock dictation hands-free, "
+                            + "then press once to stop."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
 
-                LabeledContent("Hotkey", value: settings.hotkey.displayName)
-
-                HStack(spacing: 6) {
-                    Button("Right Option") {
-                        settings.hotkey = .defaultRightOption
-                        coordinator.reinstallHotkey()
+            Section("Microphone") {
+                Picker("Input device", selection: $settings.inputDeviceUID) {
+                    Text("System Default").tag("")
+                    ForEach(inputDevices) { dev in
+                        Text(dev.name).tag(dev.uid)
                     }
-                    Button("Right Command") {
-                        settings.hotkey = Hotkey(keyCode: nil, modifiers: .maskCommand)
-                        coordinator.reinstallHotkey()
-                    }
-                    Button("F5") {
-                        settings.hotkey = Hotkey(keyCode: 96, modifiers: [])
-                        coordinator.reinstallHotkey()
-                    }
-                    Button("⌃⌥ Space") {
-                        settings.hotkey = Hotkey(keyCode: 49, modifiers: [.maskControl, .maskAlternate])
-                        coordinator.reinstallHotkey()
+                    // Keep a matching tag when the pinned device is absent so the picker
+                    // shows the choice instead of blanking, and preserves it for reconnect.
+                    if !settings.inputDeviceUID.isEmpty,
+                        !inputDevices.contains(where: { $0.uid == settings.inputDeviceUID }) {
+                        Text("Selected device (unavailable)").tag(settings.inputDeviceUID)
                     }
                 }
-                .controlSize(.small)
+                .onAppear {
+                    inputDevices = AudioRecorder.availableInputDevices().map {
+                        InputDevice(uid: $0.uid, name: $0.name)
+                    }
+                }
             }
 
             Section("Automatic Insertion") {
@@ -111,28 +156,6 @@ struct SettingsView: View {
                         // is off. Force it off so it never sits on-but-inert.
                         if !isOn { settings.smartTyping = false }
                     }
-            }
-
-            Section("Smart Typing") {
-                Toggle("Smart Typing (live preview)", isOn: $settings.smartTyping)
-                    .disabled(!engineSupportsStreaming || !eouInstalled || !settings.autoPaste)
-                    .help(smartTypingHelpText)
-                if !engineSupportsStreaming {
-                    Label(
-                        "Requires Parakeet. Switch the engine in the Engine tab.",
-                        systemImage: "info.circle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                } else if !settings.autoPaste {
-                    Label(
-                        "Requires \"Paste transcribed text at cursor automatically\" above.",
-                        systemImage: "info.circle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                EOUCard(coordinator: coordinator, isInstalled: $eouInstalled)
             }
 
             Section("Post-processing") {
@@ -153,6 +176,14 @@ struct SettingsView: View {
                 .onAppear { launchAtLogin.refresh() }
                 Toggle("Sound cues", isOn: $settings.soundCues)
                 Text("Subtle sounds when recording starts, stops, or is cancelled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("While recording", selection: $settings.recordingAudio) {
+                    ForEach(SettingsStore.RecordingAudio.allCases) { action in
+                        Text(action.label).tag(action)
+                    }
+                }
+                Text("Mute other apps' audio (music, video) while you dictate, and restore it when you stop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LabeledContent("Version \(Updater.installedVersion)") {
@@ -180,7 +211,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { eouInstalled = ParakeetEngine.eouIsInstalled() }
     }
 
     // ------------------------------------------------------------------
@@ -190,32 +220,13 @@ struct SettingsView: View {
     private var engineTab: some View {
         Form {
             Section("Speech engine") {
-                Picker("Engine", selection: $settings.engine) {
-                    ForEach(SettingsStore.Engine.allCases) { engine in
-                        Text(engine.label).tag(engine)
-                    }
+                ForEach(SettingsStore.Engine.allCases) { engine in
+                    EngineRow(
+                        engine: engine,
+                        isSelected: settings.engine == engine,
+                        onSelect: { selectEngine(engine) }
+                    )
                 }
-                .pickerStyle(.radioGroup)
-                .onChange(of: settings.engine) { _, newValue in
-                    // Whisper has no streaming engine; clear the toggle so
-                    // it doesn't stay "on" with no effect. Switching back
-                    // to Parakeet doesn't re-enable it - explicit opt-in.
-                    if newValue == .whisper {
-                        settings.smartTyping = false
-                        // If the persisted Whisper model can't translate
-                        // (Turbo or any English-only build), force Translate
-                        // off so the toggle isn't stuck on against a row
-                        // that disables it.
-                        if !ModelManager.supportsTranslation(settings.modelName) {
-                            settings.translateToEnglish = false
-                        }
-                    }
-                    coordinator.reloadEngine()
-                }
-
-                Text(settings.engine.summary)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
             }
 
             if settings.engine == .whisper {
@@ -254,9 +265,6 @@ struct SettingsView: View {
                 }
 
                 Section("Translation") {
-                    if selectedModelSupportsTranslation {
-                        sourceLanguageField
-                    }
                     Toggle("Translate speech to English", isOn: $settings.translateToEnglish)
                         .disabled(!selectedModelSupportsTranslation)
                         .help("Speak in any language; Whisper writes the transcript in English.")
@@ -273,15 +281,36 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+            } else if settings.engine == .nemotron {
+                Section("Multilingual engine") {
+                    NemotronEngineCard(coordinator: coordinator)
+                }
             } else {
                 Section("Parakeet engine") {
-                    ParakeetEngineCard(coordinator: coordinator)
+                    ParakeetEngineCard(
+                        coordinator: coordinator,
+                        version: settings.engine == .parakeetV3 ? .v3 : .v2)
                 }
+            }
+
+            // The dictation language lives with the engine too, for any engine
+            // that offers a choice (Parakeet v2 is English-only).
+            if settings.engine.offersLanguagePicker {
+                languageSection
+            }
+
+            // Smart Typing lives with the engine that provides it: only shown
+            // for streaming-capable engines, and it surfaces its own extra
+            // download (Parakeet's EOU) when there is one - Nemotron streams on
+            // its own, so no extra card appears.
+            if settings.engine.supportsSmartTyping {
+                smartTypingSection
             }
         }
         .formStyle(.grouped)
         .onAppear {
             modelVM.refreshInstalled()
+            modelVM.onDownloaded = { [weak coordinator] in coordinator?.warmupDownloadedModel($0) }
             eouInstalled = ParakeetEngine.eouIsInstalled()
             diarizerVM.refresh()
         }
@@ -740,42 +769,124 @@ struct SettingsView: View {
         .padding(.vertical, 4)
     }
 
+    // Selecting an engine from the Engine tab's radio rows. Mirrors what the old
+    // Picker's onChange did: clear Smart Typing when the new engine can't stream,
+    // drop a stuck Translate toggle on a non-translating Whisper model, reload.
+    private func selectEngine(_ engine: SettingsStore.Engine) {
+        guard settings.engine != engine else { return }
+        settings.engine = engine
+        if !engine.supportsSmartTyping { settings.smartTyping = false }
+        if engine == .whisper, !ModelManager.supportsTranslation(settings.modelName) {
+            settings.translateToEnglish = false
+        }
+        coordinator.reloadEngine()
+    }
+
+    // Smart Typing section for the Engine tab, shown only for streaming-capable
+    // engines. Parakeet v2 needs its separate EOU model, so its download card
+    // appears here; Nemotron streams with its own model, so no extra card.
+    @ViewBuilder
+    private var smartTypingSection: some View {
+        Section("Smart Typing") {
+            Toggle("Smart Typing (live preview)", isOn: $settings.smartTyping)
+                .disabled(!smartTypingAvailable)
+                .help(smartTypingHelpText)
+            Text("Types a live preview as you speak, inserting each sentence when you pause.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !settings.autoPaste {
+                Label(
+                    "Requires \u{201C}Paste transcribed text at cursor automatically\u{201D} in General.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            if settings.engine == .parakeet {
+                EOUCard(coordinator: coordinator, isInstalled: $eouInstalled)
+            }
+        }
+    }
+
+    // Smart Typing is usable when auto-paste is on, the engine can stream, and
+    // its streaming weights are present. Parakeet v2 gates on its separate EOU
+    // model; Nemotron streams with its own engine model, so no extra gate.
+    private var smartTypingAvailable: Bool {
+        guard settings.autoPaste, settings.engine.supportsSmartTyping else { return false }
+        if settings.engine == .parakeet { return eouInstalled }
+        return true
+    }
+
     private var smartTypingHelpText: String {
-        if !engineSupportsStreaming {
-            return "Available with Parakeet. Whisper has no streaming engine."
-        }
-        if !eouInstalled {
-            return "Requires the Parakeet EOU 120M model below."
-        }
         if !settings.autoPaste {
-            return "Turn on \"Paste transcribed text at cursor automatically\" above to use Smart Typing."
+            return "Turn on \"Paste transcribed text at cursor automatically\" in General to use Smart Typing."
+        }
+        if settings.engine == .parakeet, !eouInstalled {
+            return "Download the streaming model below to enable Smart Typing."
         }
         return "Shows a live preview as you speak, then inserts each sentence when you pause."
     }
 
-    private var engineSupportsStreaming: Bool {
-        settings.engine == .parakeet
-    }
-
     // The Translate toggle is meaningful only on a multilingual, non-turbo
     // Whisper model. Mirrors WhisperEngine's runtime gate so the UI never
-    // offers an option the engine would ignore. Drives the toggle's
-    // enabled state and the Source Language picker's visibility.
+    // offers an option the engine would ignore. Drives the toggle's enabled
+    // state.
     private var selectedModelSupportsTranslation: Bool {
         ModelManager.supportsTranslation(settings.modelName)
     }
 
-    // Compact row that opens a modal sheet owning the search and full
-    // 100-language list.
+    // Dictation language for the Engine tab — the shared dictationLanguage,
+    // shown for engines that offer a choice (Parakeet v2 is English-only).
+    // Whisper's 100 use the searchable sheet; Nemotron/v3's shorter lists use
+    // an inline menu.
     @ViewBuilder
-    private var sourceLanguageField: some View {
-        let selected = WhisperLanguage.named(settings.translationSourceLanguage)
+    private var languageSection: some View {
+        Section("Language") {
+            if settings.engine == .whisper {
+                whisperLanguageField
+            } else {
+                Picker("Language", selection: clampedLanguageBinding) {
+                    Text("Auto-detect").tag("")
+                    ForEach(settings.engine.languageCodes, id: \.self) { code in
+                        Text(WhisperLanguage.named(code).name).tag(code)
+                    }
+                }
+            }
+            // A language pinned on another engine that this one can't do falls
+            // back to auto-detect - say so rather than silently ignore it.
+            if !settings.dictationLanguage.isEmpty,
+                !settings.engine.languageCodes.contains(settings.dictationLanguage) {
+                Label(
+                    "\(settings.engine.label) doesn't support \(WhisperLanguage.named(settings.dictationLanguage).name) — using auto-detect.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // Shows the shared language clamped to the current engine, so an inline
+    // Picker never holds a selection outside its options (which renders blank).
+    private var clampedLanguageBinding: Binding<String> {
+        Binding(
+            get: { settings.engine.clampedLanguage(settings.dictationLanguage) },
+            set: { settings.dictationLanguage = $0 }
+        )
+    }
+
+    // Whisper's 100-language picker: a compact row opening the searchable sheet.
+    // Sets dictationLanguage, which Whisper uses for both transcription and the
+    // translate source.
+    @ViewBuilder
+    private var whisperLanguageField: some View {
+        let selected = WhisperLanguage.named(settings.dictationLanguage)
 
         Button {
             showLanguagePicker = true
         } label: {
             HStack {
-                Text("Source Language")
+                Text("Language")
                 Spacer()
                 Text(selected.name).foregroundStyle(.secondary)
                 Image(systemName: "chevron.right")
@@ -787,15 +898,15 @@ struct SettingsView: View {
         .buttonStyle(.plain)
         .sheet(isPresented: $showLanguagePicker) {
             LanguagePickerSheet(
-                selection: $settings.translationSourceLanguage,
+                selection: $settings.dictationLanguage,
                 onClose: { showLanguagePicker = false }
             )
         }
 
         Text(
-            settings.translationSourceLanguage.isEmpty
-                ? "Auto-detect can misread very short clips. Select a language for reliable short-phrase translation."
-                : "Detection is skipped. Whisper assumes the audio is \(selected.name)."
+            settings.dictationLanguage.isEmpty
+                ? "Auto-detect can misread very short clips. Pick a language for reliable short-phrase dictation."
+                : "Detection is skipped. Whisper assumes you're speaking \(selected.name)."
         )
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -861,6 +972,70 @@ final class FluidModelViewModel: ObservableObject {
 }
 
 // ----------------------------------------------------------------------
+// Engine selector row - Engine tab. Codename title + language and Live/Batch
+// badges + one honest benefit line + approx size. The whole row is the tap
+// target for selection, like the Whisper ModelRow.
+// ----------------------------------------------------------------------
+
+private struct EngineRow: View {
+    let engine: SettingsStore.Engine
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                .foregroundColor(isSelected ? .accentColor : .secondary)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(engine.label).font(.body.weight(.medium))
+                    badge(engine.languageBadge, accent: false)
+                    // Same name as the section below; the accent pill flags the
+                    // engines that unlock it. Batch engines get no pill - their
+                    // benefit line already says "inserts when you finish".
+                    if engine.supportsSmartTyping {
+                        badge("Smart Typing", accent: true)
+                    }
+                }
+                Text(engine.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 12) {
+                    stat("checkmark.seal", engine.accuracyStat)
+                    stat("bolt", engine.speedStat)
+                }
+                .padding(.top, 1)
+            }
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+    }
+
+    // Small pill. "Smart Typing" takes the accent tint to draw the eye to the
+    // app's flagship streaming engines; the language pill stays quiet gray.
+    private func badge(_ text: String, accent: Bool) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background((accent ? Color.accentColor : Color.secondary).opacity(0.15), in: Capsule())
+            .foregroundStyle(accent ? Color.accentColor : Color.secondary)
+    }
+
+    // One decision stat: an SF Symbol + monospaced-digit value, quiet gray.
+    private func stat(_ icon: String, _ text: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.caption2)
+            Text(text).font(.caption).monospacedDigit()
+        }
+        .foregroundStyle(.secondary)
+    }
+}
+
+// ----------------------------------------------------------------------
 // Parakeet engine card - Engine tab. Unlike the EOU / diarizer cards (which
 // only download on an explicit tap), Parakeet TDT v2 also auto-downloads
 // during warm-up, so its progress comes from the coordinator's shared download
@@ -870,8 +1045,23 @@ final class FluidModelViewModel: ObservableObject {
 
 private struct ParakeetEngineCard: View {
     @ObservedObject var coordinator: AppCoordinator
-    @State private var isInstalled = ParakeetEngine.batchIsInstalled()
+    let version: AsrModelVersion
+    @State private var isInstalled: Bool
     @State private var error: String?
+
+    init(coordinator: AppCoordinator, version: AsrModelVersion) {
+        self.coordinator = coordinator
+        self.version = version
+        _isInstalled = State(initialValue: ParakeetEngine.batchIsInstalled(version))
+    }
+
+    private var title: String { version == .v2 ? "Parakeet TDT v2" : "Parakeet TDT v3" }
+    private var sizeLabel: String { version == .v2 ? "~450 MB" : "~600 MB" }
+    private var blurb: String {
+        version == .v2
+            ? "Batch dictation, meetings, and voice editing. Downloads on first use."
+            : "Multilingual batch dictation (25 European languages incl. Spanish). Downloads on first use."
+    }
 
     var body: some View {
         let progress = coordinator.parakeetBatchProgress
@@ -879,15 +1069,15 @@ private struct ParakeetEngineCard: View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text("Parakeet TDT v2").font(.body.weight(.medium))
-                    Text("~450 MB").foregroundStyle(.secondary).font(.caption)
+                    Text(title).font(.body.weight(.medium))
+                    Text(sizeLabel).foregroundStyle(.secondary).font(.caption)
                     if downloading {
                         Text("downloading…").foregroundStyle(.secondary).font(.caption2)
                     } else if !isInstalled, error == nil {
                         Text("not yet downloaded").foregroundStyle(.secondary).font(.caption2)
                     }
                 }
-                Text("Batch dictation, meetings, and voice editing. Downloads on first use.")
+                Text(blurb)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let progress {
@@ -918,27 +1108,109 @@ private struct ParakeetEngineCard: View {
             }
         }
         .padding(.vertical, 4)
-        .onAppear { isInstalled = ParakeetEngine.batchIsInstalled() }
+        .onAppear { isInstalled = ParakeetEngine.batchIsInstalled(version) }
+        .onChange(of: version) { _, _ in isInstalled = ParakeetEngine.batchIsInstalled(version) }
         .onChange(of: coordinator.parakeetBatchProgress) { _, newValue in
             // A download just finished (or was cleared); re-check disk so the
             // card flips to Delete / Download correctly.
-            if newValue == nil { isInstalled = ParakeetEngine.batchIsInstalled() }
+            if newValue == nil { isInstalled = ParakeetEngine.batchIsInstalled(version) }
         }
     }
 
     private func download() {
         error = nil
         Task {
-            if case .failed(let err) = await coordinator.downloadParakeetModel() {
+            if case .failed(let err) = await coordinator.downloadParakeetModel(version) {
                 error = err.localizedDescription
             }
-            isInstalled = ParakeetEngine.batchIsInstalled()
+            isInstalled = ParakeetEngine.batchIsInstalled(version)
         }
     }
 
     private func delete() {
         error = nil
-        switch coordinator.deleteParakeetModel() {
+        switch coordinator.deleteParakeetModel(version) {
+        case .ok: isInstalled = false
+        case .busy: error = "Finish the current dictation or meeting, then try again."
+        case .failed(let err): error = err.localizedDescription
+        }
+    }
+}
+
+// Nemotron multilingual streaming card. Like ParakeetEngineCard but for the
+// single ~600 MB multilingual model; download/delete route through the
+// coordinator and progress comes from `nemotronProgress`.
+private struct NemotronEngineCard: View {
+    @ObservedObject var coordinator: AppCoordinator
+    @State private var isInstalled: Bool = NemotronStreamingEngine.isInstalled
+    @State private var error: String?
+
+    var body: some View {
+        let progress = coordinator.nemotronProgress
+        let downloading = progress != nil
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("Multilingual streaming (Nemotron)").font(.body.weight(.medium))
+                    Text("~600 MB").foregroundStyle(.secondary).font(.caption)
+                    if downloading {
+                        Text("downloading…").foregroundStyle(.secondary).font(.caption2)
+                    } else if !isInstalled, error == nil {
+                        Text("not yet downloaded").foregroundStyle(.secondary).font(.caption2)
+                    }
+                }
+                Text(
+                    "40 languages incl. Spanish, with live Smart Typing. Downloads on first use."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                if let progress {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .padding(.top, 2)
+                }
+                if let error {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(error).foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+                    .padding(.top, 2)
+                }
+            }
+            Spacer()
+            if downloading {
+                // Progress bar already conveys state.
+            } else if isInstalled {
+                Button("Delete", role: .destructive) { delete() }
+                    .controlSize(.small)
+            } else {
+                Button("Download") { download() }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear { isInstalled = NemotronStreamingEngine.isInstalled }
+        .onChange(of: coordinator.nemotronProgress) { _, newValue in
+            if newValue == nil { isInstalled = NemotronStreamingEngine.isInstalled }
+        }
+    }
+
+    private func download() {
+        error = nil
+        Task {
+            if case .failed(let err) = await coordinator.downloadNemotronModel() {
+                error = err.localizedDescription
+            }
+            isInstalled = NemotronStreamingEngine.isInstalled
+        }
+    }
+
+    private func delete() {
+        error = nil
+        switch coordinator.deleteNemotronModel() {
         case .ok: isInstalled = false
         case .busy: error = "Finish the current dictation or meeting, then try again."
         case .failed(let err): error = err.localizedDescription
@@ -947,7 +1219,7 @@ private struct ParakeetEngineCard: View {
 }
 
 // ----------------------------------------------------------------------
-// Parakeet EOU 120M card - Smart Typing section (General tab). Like the
+// Parakeet EOU 120M card - Smart Typing section (Engine tab). Like the
 // Parakeet engine card, the EOU model auto-downloads during warm-up (gated on
 // Smart Typing being on), so its progress comes from the coordinator's shared
 // download state - that's what shows a bar for an auto-download, not just a
@@ -1115,6 +1387,10 @@ final class ModelPickerViewModel: ObservableObject {
     // across tab switches.
     @Published var errors: [String: String] = [:]
 
+    // Fired after a successful download so the coordinator can warm the model
+    // if it's the active one (see AppCoordinator.warmupDownloadedModel).
+    var onDownloaded: ((String) -> Void)?
+
     func refreshInstalled() {
         installed = Set(ModelManager.curatedModels.map(\.id).filter { ModelManager.isInstalled($0) })
     }
@@ -1129,6 +1405,7 @@ final class ModelPickerViewModel: ObservableObject {
                 }
                 self.progress[modelName] = nil
                 self.refreshInstalled()
+                self.onDownloaded?(modelName)
             } catch {
                 self.progress[modelName] = nil
                 self.errors[modelName] = friendlyDownloadError(error)
